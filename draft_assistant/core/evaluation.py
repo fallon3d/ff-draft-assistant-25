@@ -51,21 +51,20 @@ def _baseline_index(pos: str, teams: int, starters: Dict[str,int]) -> int:
 def _compute_vbd(df: pd.DataFrame, teams: int, starters: Dict[str,int]) -> pd.Series:
     """
     Compute VBD against the baseline *after* all value modifiers.
+    Uses df['value'] (falls back to value_blend).
     """
-    vbd = pd.Series(0.0, index=df.index, dtype=float)
-    # Ensure the 'value' column exists
     vals = df["value"] if "value" in df.columns else df.get("value_blend", pd.Series(0.0, index=df.index))
     tmp = df.assign(_val=vals)
 
+    vbd = pd.Series(0.0, index=df.index, dtype=float)
     for pos in ("QB","RB","WR","TE","K","DST"):
         sub = tmp[tmp["POS"] == pos].sort_values("_val", ascending=False)
         if sub.empty:
             continue
         idx = min(_baseline_index(pos, teams, starters), len(sub))
         baseline = float(sub.iloc[idx-1]["_val"])
-        # <- this was the bug; keep only the bracketed assignment:
+        # Correct assignment (no attribute setter bug)
         vbd.loc[sub.index] = sub["_val"] - baseline
-
     return vbd
 
 def evaluate_players(
@@ -75,7 +74,8 @@ def evaluate_players(
     rounds: int,
     weight_proj: float = 0.65
 ) -> pd.DataFrame:
-    if df_in is None or df_in.empty: return df_in
+    if df_in is None or df_in.empty:
+        return df_in
     df = df_in.copy()
 
     scoring_cfg = dict(DEFAULT_SCORING)
@@ -84,8 +84,6 @@ def evaluate_players(
     # Base projections and blended value (if PROJ_PTS provided)
     df["calc_proj"] = df.apply(lambda r: _proj_points_row(r, scoring_cfg), axis=1)
     df["proj_pts"] = df["PROJ_PTS"] if "PROJ_PTS" in df.columns else 0.0
-    df["value_raw"] = df["calc_proj"]
-
     if "PROJ_PTS" in df.columns:
         df["value_blend"] = weight_proj * df["calc_proj"] + (1.0 - weight_proj) * df["PROJ_PTS"]
     else:
@@ -100,9 +98,8 @@ def evaluate_players(
     def _inj_pen(v):
         s = str(v or "").strip().lower()
         return INJURY_PEN.get(s, 0.0)
-    df["inj_mult"] = df.get("INJURY_RISK", pd.Series([""]*len(df))).map(_inj_pen).fillna(0.0)
 
-    # Tiny OC confidence bump when OC present
+    df["inj_mult"] = df.get("INJURY_RISK", pd.Series([""]*len(df))).map(_inj_pen).fillna(0.0)
     df["coach_mult"] = 0.01 * ((~df.get("OC", pd.Series([None]*len(df))).isna()).astype(float))
 
     # Final value before VBD
