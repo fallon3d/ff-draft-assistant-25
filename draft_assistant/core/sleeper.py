@@ -1,5 +1,6 @@
 """
 Sleeper API helpers, including players and mock parsing.
+Adds K and DST support (maps DEF -> DST).
 """
 import re
 import time
@@ -79,9 +80,13 @@ def players_df_from_dict(players_map: dict) -> pd.DataFrame:
     rows = []
     for _, p in (players_map or {}).items():
         pos = p.get("position") or (p.get("fantasy_positions") or [None])[0]
-        if pos not in ("QB","RB","WR","TE"): continue
+        if pos == "DEF":  # map Sleeper DEF to DST
+            pos = "DST"
+        if pos not in ("QB","RB","WR","TE","K","DST"): 
+            continue
         full = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
-        if not full: continue
+        if not full: 
+            continue
         team = p.get("team") or p.get("active_team") or "FA"
         bye = p.get("bye_week") or 0
         rookie = 1 if (p.get("rookie") or p.get("years_exp") in (0,1)) else 0
@@ -118,7 +123,9 @@ def picks_to_internal_log(picks: list, players_map: dict) -> list[dict]:
         if pid and players_map and pid in players_map:
             info = players_map[pid]
             full = info.get("full_name") or f"{info.get('first_name','')} {info.get('last_name','')}".strip()
-            first = full; last = ""; pos = pos or info.get("position")
+            first = full; last = ""; 
+            pos = "DST" if (pos == "DEF") else (pos or info.get("position"))
+            if pos == "DEF": pos = "DST"
         else:
             first = f"{meta.get('first_name','')} {meta.get('last_name','')}".strip() or meta.get("name","")
             last = ""
