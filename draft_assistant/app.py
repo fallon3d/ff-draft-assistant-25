@@ -1,11 +1,11 @@
 """
 Fantasy Football Draft Assistant (Streamlit)
-- Live draft sync (Sleeper public API)
-- Mock Draft with AI archetypes OR read-only sync from a Sleeper Mock URL
-- Player evaluation (VBD-ish) + suggestions
-- PDF export (ReportLab)
-- Combine player pool from Sleeper live list + up to 3 uploaded CSVs + sample CSV
-All zero-cost sources. Robust to missing schedule/coaching files.
+Now with:
+- Mock Draft that mirrors Live Draft UI, driven by a Sleeper Mock URL
+- Unified suggestions engine for Live + Mock (Top 8 + explanations)
+- Late-round rookie upside bias
+- Recognize user by Sleeper username (default: Fallon3D)
+- Player Board removed
 """
 
 import os
@@ -13,11 +13,9 @@ import random
 import pandas as pd
 import streamlit as st
 
-# --- App-wide defaults / state guards ---
 st.set_page_config(page_title="Fantasy Football Draft Assistant", layout="wide")
-league_info = None  # used by Export tab; avoids NameError
+league_info = None  # guard for Export tab
 
-# Local imports
 from core import utils, sleeper, roster, evaluation, suggestions, mock_ai, pdf_report
 
 # ---------- CONFIG ----------
@@ -26,9 +24,14 @@ config = utils.read_config()
 # ---------- SIDEBAR SETTINGS ----------
 st.sidebar.title("Settings")
 
-# Sleeper
+# Sleeper identification
+sleeper_username = st.sidebar.text_input(
+    "Your Sleeper Username",
+    value=str(config.get("user_profile", {}).get("sleeper_username", "Fallon3D")),
+    key="settings_username",
+)
 league_id = st.sidebar.text_input(
-    "Sleeper League ID",
+    "Sleeper League ID (Live)",
     value=str(config.get("sleeper", {}).get("league_id", "")),
     key="settings_league_id",
 )
@@ -41,17 +44,17 @@ poll_seconds = st.sidebar.number_input(
     key="settings_poll_sec",
 )
 
-# Draft dims (global defaults; Mock tab can override)
+# Draft dims (defaults for both modes)
 teams_default = int(config.get("draft", {}).get("teams", 12))
 rounds_default = int(config.get("draft", {}).get("rounds", 15))
 teams_setting = st.sidebar.number_input(
-    "Number of Teams (default)",
+    "Default: Number of Teams",
     min_value=2,
     value=teams_default,
     key="settings_num_teams",
 )
 rounds_setting = st.sidebar.number_input(
-    "Number of Rounds (default)",
+    "Default: Number of Rounds",
     min_value=1,
     value=rounds_default,
     key="settings_num_rounds",
@@ -66,6 +69,7 @@ extra3_file = st.sidebar.file_uploader("Extra Players CSV #3", type="csv", key="
 schedule_file = st.sidebar.file_uploader("Schedule CSV (optional)", type="csv", key="upload_schedule")
 
 if st.sidebar.button("Save Settings", key="settings_save_btn"):
+    config.setdefault("user_profile", {})["sleeper_username"] = sleeper_username.strip()
     config.setdefault("sleeper", {})["league_id"] = league_id.strip()
     config["sleeper"]["poll_seconds"] = int(poll_seconds)
     config.setdefault("draft", {})["teams"] = int(teams_setting)
@@ -101,9 +105,9 @@ if schedule_file is not None:
 # ---------- HEADER ----------
 st.title("🏈 Fantasy Football Draft Assistant")
 
-# ---------- TABS ----------
-tab_live, tab_mock, tab_board, tab_suggest, tab_export = st.tabs(
-    ["Live Draft", "Mock Draft", "Player Board", "Suggestions", "Export"]
+# ---------- TABS (Player Board removed) ----------
+tab_live, tab_mock, tab_suggest, tab_export = st.tabs(
+    ["Live Draft", "Mock Draft", "Suggestions", "Export"]
 )
 
 # ===================== LIVE DRAFT =====================
@@ -144,15 +148,19 @@ with tab_live:
                 next_overall = total_picks_made + 1
 
                 rnd, pick_in_rnd, slot = utils.snake_position(next_overall, int(teams_setting))
-                team_display = utils.slot_to_display_name(slot, users) or f"Slot {slot}"
+                your_roster_id = utils.user_roster_id(users, sleeper_username)
+                you_on_clock = (slot == your_roster_id)
 
+                team_display = utils.slot_to_display_name(slot, users) or f"Slot {slot}"
                 if total_picks_made < total_picks_all:
                     st.markdown(
                         f"**Current Pick:** Round {rnd}, Pick {pick_in_rnd} — **{team_display}** on the clock."
+                        + ("  🎯 _(That’s you)_" if you_on_clock else "")
                     )
                 else:
                     st.success("Draft complete.")
 
+                # Team Rosters
                 st.markdown("### Team Rosters")
                 rosters = roster.build_rosters(picks, users)
                 if not rosters:
@@ -162,139 +170,18 @@ with tab_live:
                     i = 0
                     for team_name, ros in rosters.items():
                         with cols[i % 3]:
-                            st.write(f"**{team_name}**")
+                            highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
+                            st.write(f"{highlight}**{team_name}**")
                             for pos, players in ros.items():
                                 if players:
                                     st.write(f"- {pos}: {', '.join(players)}")
                         i += 1
 
-# ===================== MOCK DRAFT (supports Sleeper Mock URL) =====================
-with tab_mock:
-    st.subheader("Mock Draft")
-
-    # Data source controls
-    st.markdown("#### Data Source")
-    use_sleeper_players = st.checkbox("Include Sleeper live player list", value=True, key="mock_include_sleeper_players")
-
-    # Allow user to provide a Sleeper Mock URL to read current picks
-    mock_url = st.text_input("Sleeper Mock Draft URL (optional)", value="", key="mock_sleeper_url")
-    load_mock_btn = st.button("Load from Sleeper Mock URL", key="mock_load_btn")
-
-    # Controls for local simulation (still used after loading a Sleeper mock)
-    user_slot = st.number_input(
-        "Your Draft Slot (1 = first pick)",
-        min_value=1,
-        max_value=int(config.get("draft", {}).get("teams", 12)),
-        value=1,
-        key="mock_user_slot",
-    )
-    num_teams = st.number_input(
-        "Number of Teams",
-        min_value=2,
-        value=int(config.get("draft", {}).get("teams", 12)),
-        key="mock_num_teams",
-    )
-    num_rounds = st.number_input(
-        "Number of Rounds",
-        min_value=1,
-        value=int(config.get("draft", {}).get("rounds", 15)),
-        key="mock_num_rounds",
-    )
-    c1, c2, c3 = st.columns([1, 1, 1])
-    start = c1.button("Start / Resume (AI sim)", key="mock_start")
-    pause = c2.button("Pause", key="mock_pause")
-    reset = c3.button("Reset", key="mock_reset")
-
-    # Init / Reset
-    if reset:
-        st.session_state.pop("mock_state", None)
-        st.success("Mock draft reset.")
-
-    # Build the combined player pool (Sleeper + CSVs)
-    combined_df = utils.load_combined_player_pool(
-        include_sleeper=use_sleeper_players,
-        base_path=os.path.join(DATA_DIR, "sample_players.csv"),
-        extra_paths=[
-            os.path.join(DATA_DIR, "extra_players_1.csv"),
-            os.path.join(DATA_DIR, "extra_players_2.csv"),
-            os.path.join(DATA_DIR, "extra_players_3.csv"),
-        ],
-    )
-
-    # If the user provided a Sleeper mock URL, load its picks and sync state
-    if load_mock_btn and mock_url.strip():
-        draft_id = sleeper.parse_draft_id_from_url(mock_url.strip())
-        if not draft_id:
-            st.error("Could not parse a draft_id from that URL. It should contain `/draft/<id>`.")
-        else:
-            picks = sleeper.get_picks(draft_id) or []
-            players_map = sleeper.get_players_nfl() or {}
-            picked_names = sleeper.picked_player_names(picks, players_map)  # list of strings
-            # Remove already-picked players from availability
-            available = utils.remove_players_by_name(combined_df.copy(), picked_names)
-            # Try to read rounds/teams from draft if available
-            dmeta = sleeper.get_draft(draft_id) or {}
-            rounds_from_api = int(dmeta.get("settings", {}).get("rounds", num_rounds))
-            teams_from_api = int(dmeta.get("settings", {}).get("teams", num_teams) or dmeta.get("teams", num_teams))
-
-            # Initialize a read-only synced state (user can continue the draft locally if desired)
-            st.session_state.mock_state = {
-                "running": False,                   # paused by default (read-only)
-                "synced_from_sleeper": True,
-                "sleeper_draft_id": draft_id,
-                "teams": [{"slot": i, "name": "You" if i == int(user_slot) else f"Team {i}", "strategy": "Balanced", "picks": []}
-                          for i in range(1, int(teams_from_api) + 1)],
-                "available": evaluation.evaluate_players(available, config).reset_index(drop=True),
-                "picks": sleeper.picks_to_internal_log(picks, players_map),
-                "current_pick": len(picks) + 1,
-                "user_slot": int(user_slot),
-                "num_teams": int(teams_from_api),
-                "num_rounds": int(rounds_from_api),
-            }
-            st.success(f"Loaded Sleeper mock {draft_id}. Synced {len(picks)} picks.")
-
-    # Start AI simulation from our local combined pool (if no synced state or user wants to simulate)
-    if ("mock_state" not in st.session_state) and start:
-        evaluated = evaluation.evaluate_players(combined_df, config)
-        strategies = list(mock_ai.STRATEGIES)
-        random.shuffle(strategies)
-        teams_list = []
-        for i in range(1, int(num_teams) + 1):
-            strategy = strategies[(i - 1) % len(strategies)]
-            teams_list.append({"slot": i, "name": "You" if i == int(user_slot) else f"AI {i}", "strategy": strategy, "picks": []})
-        st.session_state.mock_state = {
-            "running": True,
-            "synced_from_sleeper": False,
-            "sleeper_draft_id": None,
-            "teams": teams_list,
-            "available": evaluated.reset_index(drop=True),
-            "picks": [],
-            "current_pick": 1,
-            "user_slot": int(user_slot),
-            "num_teams": int(num_teams),
-            "num_rounds": int(num_rounds),
-        }
-
-    # Pause/Resume
-    if "mock_state" in st.session_state:
-        if pause:
-            st.session_state.mock_state["running"] = False
-        if start:
-            st.session_state.mock_state["running"] = True
-
-    # Simulation / UI
-    if "mock_state" in st.session_state:
-        S = st.session_state.mock_state
-
-        # If this mock was loaded from Sleeper, allow a quick resync button
-        if S.get("synced_from_sleeper") and S.get("sleeper_draft_id"):
-            if st.button("Re-sync from Sleeper Mock", key="mock_resync_btn"):
-                picks = sleeper.get_picks(S["sleeper_draft_id"]) or []
-                players_map = sleeper.get_players_nfl() or {}
-                picked_names = sleeper.picked_player_names(picks, players_map)
-                # Rebuild from current combined pool to capture any new uploads
-                combined_df = utils.load_combined_player_pool(
-                    include_sleeper=use_sleeper_players,
+                # ---------- SUGGESTIONS (Top 8) ----------
+                st.markdown("### Suggestions for This Pick")
+                # Build available pool: uploads + (optionally) Sleeper live players
+                available_pool = utils.load_combined_player_pool(
+                    include_sleeper=True,
                     base_path=os.path.join(DATA_DIR, "sample_players.csv"),
                     extra_paths=[
                         os.path.join(DATA_DIR, "extra_players_1.csv"),
@@ -302,92 +189,50 @@ with tab_mock:
                         os.path.join(DATA_DIR, "extra_players_3.csv"),
                     ],
                 )
-                available = utils.remove_players_by_name(combined_df.copy(), picked_names)
-                S["available"] = evaluation.evaluate_players(available, config).reset_index(drop=True)
-                S["picks"] = sleeper.picks_to_internal_log(picks, players_map)
-                S["current_pick"] = len(picks) + 1
-                st.session_state.mock_state = S
-                st.success(f"Re-synced. Now at {len(picks)} picks.")
+                players_map = sleeper.get_players_nfl() or {}
+                picked_names = sleeper.picked_player_names(picks, players_map)
+                available_pool = utils.remove_players_by_name(available_pool, picked_names)
+                available_pool = utils.normalize_player_headers(available_pool)
 
-        # If running AI, advance until user's turn
-        if S["running"]:
-            progressed = 0
-            while progressed < 50:
-                rnd, pick_in_rnd, slot = utils.snake_position(S["current_pick"], S["num_teams"])
-                if rnd > S["num_rounds"]:
-                    S["running"] = False
-                    break
-                if slot == S["user_slot"]:
-                    break
-                team = next((t for t in S["teams"] if t["slot"] == slot), None)
-                if team is None or S["available"].empty:
-                    S["running"] = False
-                    break
-                idx = mock_ai.pick_for_team(S["available"], team["strategy"], rnd)
-                if idx is None or idx not in S["available"].index:
-                    S["running"] = False
-                    break
-                pick = S["available"].loc[idx]
-                team["picks"].append(pick["PLAYER"])
-                S["picks"].append(
-                    {"round": rnd, "pick_no": pick_in_rnd, "team": team["name"],
-                     "metadata": {"first_name": pick["PLAYER"], "last_name": "", "position": pick.get("POS")}}
-                )
-                S["available"] = S["available"].drop(idx).reset_index(drop=True)
-                S["current_pick"] += 1
-                progressed += 1
-            st.session_state.mock_state = S
+                # Your current roster (by names) for needs/bye checks
+                your_name = utils.roster_display_name(users, your_roster_id) if your_roster_id else ""
+                your_picks = [p for p in picks if str(p.get("roster_id")) == str(your_roster_id)]
+                your_names = [ (p.get("metadata") or {}).get("first_name","") for p in your_picks ]
 
-        # Current status
-        S = st.session_state.mock_state
-        rnd, pick_in_rnd, slot = utils.snake_position(S["current_pick"], S["num_teams"])
-        if rnd <= S["num_rounds"]:
-            st.write(f"**Current:** Round {rnd}, Pick {pick_in_rnd} — {'Your turn' if slot == S['user_slot'] else 'AI/Other'}")
+                ranked = suggestions.rank_suggestions(
+                    available_pool,
+                    round_number=rnd,
+                    total_rounds=int(rounds_setting),
+                    user_picked_names=your_names,
+                    pick_log=picks,
+                    teams=int(teams_setting),
+                    username=sleeper_username,
+                ).head(8)
 
-        # If it's user's turn, offer suggestions from the combined pool (with picked removed)
-        if slot == S["user_slot"] and rnd <= S["num_rounds"]:
-            st.markdown("### Your Pick")
-            top5 = suggestions.top_suggestions(S["available"], None, 5)
-            if not top5.empty:
-                choice = st.selectbox("Top suggestions", options=top5["PLAYER"].tolist(), key="mock_choice_box")
-                pick_now = st.button("Draft Selected Player", key="mock_pick_now")
-                if pick_now:
-                    sel_idx = S["available"][S["available"]["PLAYER"] == choice].index
-                    if not sel_idx.empty:
-                        idx = int(sel_idx[0])
-                        pick = S["available"].loc[idx]
-                        S["picks"].append(
-                            {"round": rnd, "pick_no": pick_in_rnd, "team": "You",
-                             "metadata": {"first_name": pick["PLAYER"], "last_name": "", "position": pick.get("POS")}}
-                        )
-                        S["available"] = S["available"].drop(idx).reset_index(drop=True)
-                        S["current_pick"] += 1
-                        st.session_state.mock_state = S
-                        st.experimental_rerun()
-            else:
-                st.info("No available players to pick.")
+                if ranked.empty:
+                    st.info("No candidates available.")
+                else:
+                    for _, row in ranked.iterrows():
+                        st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f}")
+                        st.caption(row['why'])
 
-        # Pick Log
-        with st.expander("Pick Log", expanded=True):
-            if S["picks"]:
-                for p in S["picks"][-50:]:
-                    st.write(f"Round {p['round']} • Pick {p['pick_no']} • {p['team']} → {p['metadata']['first_name']}")
-            else:
-                st.caption("No picks yet.")
+# ===================== MOCK DRAFT (mirrors Live Draft, from Sleeper Mock URL) =====================
+with tab_mock:
+    st.subheader("Mock Draft (Practice Mode)")
 
-        # Your roster
-        your_roster = [p["metadata"]["first_name"] for p in S["picks"] if p["team"] == "You"]
-        st.markdown("### Your Roster")
-        if your_roster:
-            st.write(", ".join(your_roster))
-        else:
-            st.caption("No players yet.")
+    mock_url = st.text_input("Sleeper Mock Draft URL", value="", key="mock_sleeper_url")
+    colm1, colm2, colm3 = st.columns([1,1,1])
+    load_mock_btn = colm1.button("Load / Re-sync Mock", key="mock_load_btn")
+    clear_mock_btn = colm2.button("Reset Practice", key="mock_reset_btn")
+    auto_sim = colm3.toggle("Auto-sim to your picks", value=False, key="mock_auto_sim")
 
-# ===================== PLAYER BOARD =====================
-with tab_board:
-    st.subheader("Player Board")
-    df_players = utils.load_combined_player_pool(
-        include_sleeper=True,   # always show everything here for browsing
+    if clear_mock_btn:
+        st.session_state.pop("mock_state", None)
+        st.success("Practice state cleared.")
+
+    # Build full pool up-front
+    combined_pool = utils.load_combined_player_pool(
+        include_sleeper=True,
         base_path=os.path.join(DATA_DIR, "sample_players.csv"),
         extra_paths=[
             os.path.join(DATA_DIR, "extra_players_1.csv"),
@@ -395,38 +240,128 @@ with tab_board:
             os.path.join(DATA_DIR, "extra_players_3.csv"),
         ],
     )
-    df_players = utils.normalize_player_headers(df_players)
-    if df_players.empty:
-        st.info("No player data found. Upload CSVs in the sidebar.")
-    else:
-        pos_filter = st.multiselect(
-            "Position", options=sorted(df_players["POS"].dropna().unique().tolist()),
-            default=sorted(df_players["POS"].dropna().unique().tolist()),
-            key="pb_pos"
-        )
-        team_filter = st.multiselect(
-            "Team", options=sorted(df_players["TEAM"].dropna().unique().tolist()),
-            default=sorted(df_players["TEAM"].dropna().unique().tolist()),
-            key="pb_team"
-        )
-        tier_filter = st.multiselect(
-            "Tier", options=sorted(df_players["TIERS"].dropna().unique().astype(str).tolist()),
-            default=sorted(df_players["TIERS"].dropna().unique().astype(str).tolist()),
-            key="pb_tier"
-        )
-        filtered = df_players[
-            (df_players["POS"].isin(pos_filter)) &
-            (df_players["TEAM"].isin(team_filter)) &
-            (df_players["TIERS"].astype(str).isin(tier_filter))
-        ].copy()
-        st.dataframe(
-            filtered[["RK", "PLAYER", "POS", "TEAM", "BYE", "TIERS"]].reset_index(drop=True),
-            use_container_width=True
-        )
+    combined_pool = utils.normalize_player_headers(combined_pool)
 
-# ===================== SUGGESTIONS =====================
+    if load_mock_btn and mock_url.strip():
+        draft_id = sleeper.parse_draft_id_from_url(mock_url.strip())
+        if not draft_id:
+            st.error("Could not parse a draft_id from that URL. It should contain `/draft/<id>`.")
+        else:
+            picks = sleeper.get_picks(draft_id) or []
+            dmeta = sleeper.get_draft(draft_id) or {}
+            teams_from_api = int(dmeta.get("settings", {}).get("teams", config.get("draft", {}).get("teams", 12)) or dmeta.get("teams", 12))
+            rounds_from_api = int(dmeta.get("settings", {}).get("rounds", config.get("draft", {}).get("rounds", 15)))
+            users = dmeta.get("users") or []  # some mock endpoints include users; if not, we simulate
+            players_map = sleeper.get_players_nfl() or {}
+
+            picked_names = sleeper.picked_player_names(picks, players_map)
+            available = utils.remove_players_by_name(combined_pool.copy(), picked_names)
+            your_roster_id = utils.user_roster_id(users, sleeper_username) or 1  # fallback to 1 if unknown
+
+            st.session_state.mock_state = {
+                "draft_id": draft_id,
+                "teams": teams_from_api,
+                "rounds": rounds_from_api,
+                "users": users,
+                "your_roster_id": int(your_roster_id),
+                "pick_log": sleeper.picks_to_internal_log(picks, players_map),
+                "available": evaluation.evaluate_players(available, config).reset_index(drop=True),
+                "current_pick": len(picks) + 1,
+            }
+            st.success(f"Mock {draft_id} loaded. Synced {len(picks)} picks.")
+
+    # If we have state, show the same UI as Live
+    if "mock_state" in st.session_state:
+        S = st.session_state.mock_state
+        teams = int(S["teams"]); rounds = int(S["rounds"])
+        pick_log = S["pick_log"]
+        next_overall = len(pick_log) + 1
+        rnd, pick_in_rnd, slot = utils.snake_position(next_overall, teams)
+        you_on_clock = (slot == S.get("your_roster_id"))
+
+        st.write(f"**Current Pick:** Round {rnd}, Pick {pick_in_rnd} — Slot {slot}" + ("  🎯 _(That’s you)_" if you_on_clock else ""))
+
+        # Team Rosters (from pick_log)
+        st.markdown("### Team Rosters")
+        # fabricate users list for display if missing
+        users = S.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams+1)]
+        # Convert internal pick_log to Sleeper-like simple picks for roster builder
+        simple_picks = []
+        for p in pick_log:
+            # Estimate roster_id by snake order slot at that overall
+            r, pr, sl = utils.snake_position( (p["round"]-1)*teams + p["pick_no"], teams )
+            simple_picks.append({"roster_id": sl, "metadata": p.get("metadata", {})})
+        ros = roster.build_rosters(simple_picks, users)
+        cols = st.columns(3)
+        i = 0
+        for team_name, rmap in ros.items():
+            with cols[i % 3]:
+                highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
+                st.write(f"{highlight}**{team_name}**")
+                for pos, players in rmap.items():
+                    if players:
+                        st.write(f"- {pos}: {', '.join(players)}")
+            i += 1
+
+        # Auto-sim other teams until it's your turn
+        if auto_sim and not you_on_clock and rnd <= rounds:
+            progressed = 0
+            while progressed < 50 and not you_on_clock:
+                # AI pick for this slot
+                if S["available"].empty: break
+                idx = mock_ai.pick_for_team(S["available"], "Balanced", rnd)
+                if idx is None or idx not in S["available"].index: break
+                pk = S["available"].loc[idx]
+                pick_log.append({"round": rnd, "pick_no": pick_in_rnd, "team": f"Slot {slot}",
+                                 "metadata": {"first_name": pk["PLAYER"], "last_name": "", "position": pk.get("POS")}})
+                S["available"] = S["available"].drop(idx).reset_index(drop=True)
+                # advance
+                next_overall += 1
+                rnd, pick_in_rnd, slot = utils.snake_position(next_overall, teams)
+                you_on_clock = (slot == S.get("your_roster_id"))
+                progressed += 1
+            S["pick_log"] = pick_log
+            S["current_pick"] = next_overall
+            st.session_state.mock_state = S
+            st.experimental_rerun()
+
+        # Suggestions (Top 8) for practice pick
+        st.markdown("### Suggestions for This Pick")
+        ranked = suggestions.rank_suggestions(
+            S["available"],
+            round_number=rnd,
+            total_rounds=rounds,
+            user_picked_names=[p["metadata"]["first_name"] for p in pick_log if utils.slot_for_overall((p["round"]-1)*teams + p["pick_no"], teams) == S.get("your_roster_id")],
+            pick_log=pick_log,
+            teams=teams,
+            username=sleeper_username,
+        ).head(8)
+
+        if ranked.empty:
+            st.info("No candidates available.")
+        else:
+            for _, row in ranked.iterrows():
+                st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f}")
+                st.caption(row['why'])
+
+        # Practice: make your pick locally
+        if you_on_clock and rnd <= rounds:
+            choice = st.selectbox("Choose your pick (practice)", options=ranked["PLAYER"].tolist(), key="mock_choice_box")
+            if st.button("Draft Selected Player (practice)", key="mock_pick_now"):
+                sel_idx = S["available"][S["available"]["PLAYER"] == choice].index
+                if not sel_idx.empty:
+                    idx = int(sel_idx[0])
+                    pk = S["available"].loc[idx]
+                    pick_log.append({"round": rnd, "pick_no": pick_in_rnd, "team": "You",
+                                     "metadata": {"first_name": pk["PLAYER"], "last_name": "", "position": pk.get("POS")}})
+                    S["available"] = S["available"].drop(idx).reset_index(drop=True)
+                    S["current_pick"] = next_overall + 1
+                    st.session_state.mock_state = S
+                    st.experimental_rerun()
+
+# ===================== SUGGESTIONS (global glance) =====================
 with tab_suggest:
-    st.subheader("Suggestions")
+    st.subheader("Global Suggestions Snapshot")
     base_df = utils.load_combined_player_pool(
         include_sleeper=True,
         base_path=os.path.join(DATA_DIR, "sample_players.csv"),
@@ -437,29 +372,26 @@ with tab_suggest:
         ],
     )
     base_df = utils.normalize_player_headers(base_df)
-    if base_df.empty:
-        st.info("No player data available.")
-    else:
-        evaluated = evaluation.evaluate_players(base_df, config)
-        top20 = evaluated.head(20)
-        for _, row in top20.iterrows():
-            st.write(
-                f"{int(row['RK']) if pd.notna(row['RK']) else 0}. **{row['PLAYER']}** "
-                f"({row['POS']}, {row['TEAM']}) — "
-                f"Value: {row['value']:.1f} | VBD: {row['vbd']:.1f} "
-                f"| _{row['notes']}_"
-            )
+    evaluated = evaluation.evaluate_players(base_df, config)
+    # No pick context here; just top 8 values
+    ranked = suggestions.rank_suggestions(
+        evaluated, round_number=1, total_rounds=int(rounds_setting),
+        user_picked_names=[], pick_log=[], teams=int(teams_setting), username=sleeper_username,
+    ).head(8)
+    for _, row in ranked.iterrows():
+        st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f}")
+        st.caption(row['why'])
 
 # ===================== EXPORT =====================
 with tab_export:
     st.subheader("Export & PDF")
-    st.write("Generate a simple PDF report of your draft (mock or live).")
     picks_for_pdf = []
     my_slot = None
+    # Prefer mock practice picks if present
     if "mock_state" in st.session_state:
         S = st.session_state.mock_state
-        picks_for_pdf = S.get("picks", [])
-        my_slot = S.get("user_slot")
+        picks_for_pdf = S.get("pick_log", [])
+        my_slot = S.get("your_roster_id")
     league_name = (league_info or {}).get("name") if league_info else "My League"
     if st.button("Download Draft PDF", key="export_pdf_btn"):
         pdf_bytes = pdf_report.generate_pdf(league_name, picks_for_pdf, my_slot)
