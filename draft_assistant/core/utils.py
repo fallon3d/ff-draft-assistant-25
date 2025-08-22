@@ -1,12 +1,12 @@
 """
 Utility helpers: config, snake math, header normalization, combined pool,
-and Sleeper user helpers.
+Sleeper user helpers, and exact distance to next pick in a snake draft.
 """
 import os
 import re
 import toml
 import pandas as pd
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 def read_config(path: str = os.path.join(os.path.dirname(__file__), "..", "config.toml")) -> dict:
     path = os.path.abspath(path)
@@ -19,7 +19,8 @@ def save_config(config: dict, path: str = os.path.join(os.path.dirname(__file__)
     with open(path, "w") as f:
         toml.dump(config, f)
 
-def snake_position(overall_pick: int, teams: int):
+# ---------- Snake draft math ----------
+def snake_position(overall_pick: int, teams: int) -> Tuple[int,int,int]:
     if teams <= 0 or overall_pick <= 0:
         return (0, 0, 0)
     round_num = (overall_pick - 1) // teams + 1
@@ -30,6 +31,32 @@ def snake_position(overall_pick: int, teams: int):
 def slot_for_overall(overall_pick: int, teams: int) -> int:
     return snake_position(overall_pick, teams)[2]
 
+def _pick_index_for_slot(round_num: int, teams: int, user_slot: int) -> int:
+    """1-indexed pick index within a round for a given slot."""
+    if round_num % 2 == 1:  # odd rounds: 1..teams
+        return user_slot
+    else:  # even rounds: teams..1
+        return teams - user_slot + 1
+
+def next_pick_overall(current_overall: int, teams: int, user_slot: int) -> int:
+    """Return the next overall number when the given slot will pick again."""
+    r, pick_in_round, _ = snake_position(current_overall, teams)
+    user_idx_now = _pick_index_for_slot(r, teams, user_slot)
+    if pick_in_round < user_idx_now:
+        # later this round
+        return (r - 1) * teams + user_idx_now
+    else:
+        # next round
+        r_next = r + 1
+        user_idx_next = _pick_index_for_slot(r_next, teams, user_slot)
+        return (r) * teams + user_idx_next
+
+def picks_until_next_turn(current_overall: int, teams: int, user_slot: int) -> int:
+    """How many picks until the user's next pick (0 if now)."""
+    nxt = next_pick_overall(current_overall, teams, user_slot)
+    return max(0, nxt - current_overall)
+
+# ---------- Sleeper helpers ----------
 def slot_to_display_name(slot: int, users: list) -> str:
     for u in users or []:
         if str(u.get("roster_id")) == str(slot):
@@ -54,7 +81,7 @@ def roster_display_name(users: list, roster_id: int) -> str:
             return u.get("display_name") or u.get("username") or f"Slot {roster_id}"
     return f"Slot {roster_id}"
 
-# ---- Header normalization ----
+# ---------- Header normalization & merging ----------
 HEADER_ALIASES = {
     "PLAYER": ["PLAYER", "PLAYER NAME", "NAME"],
     "TEAM": ["TEAM", "NFL TEAM"],
@@ -66,6 +93,12 @@ HEADER_ALIASES = {
     "ADP": ["ADP", "Avg. Draft Position", "Average Draft Position"],
     "ROOKIE": ["ROOKIE"],  # optional hint
 }
+
+def _normalize_pos_value(x: str) -> str:
+    s = str(x).strip().upper()
+    if s in ("DEF", "DST", "D/ST", "D-ST", "TEAM DEF", "TEAM D", "DEFENSE"):
+        return "DST"
+    return s
 
 def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -87,6 +120,8 @@ def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
         except Exception:
             pass
+    # Normalize DEF/DST naming
+    df["POS"] = df["POS"].apply(_normalize_pos_value)
     return df
 
 # ---- Name normalization & merging ----
