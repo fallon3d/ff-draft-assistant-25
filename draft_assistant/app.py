@@ -101,14 +101,24 @@ tab_live, tab_mock, tab_board, tab_suggest, tab_export = st.tabs(
 # ===================== LIVE DRAFT =====================
 with tab_live:
     st.subheader("Live Draft (Sleeper)")
+
+    # Auto-refresh controls (no st.autorefresh; use safe alternatives)
+    col1, col2 = st.columns([1, 1])
+    auto = col1.toggle("Auto-refresh", value=False, key="live_auto_refresh_toggle")
+    col2.button("Refresh now", on_click=st.experimental_rerun, key="live_refresh_btn")
+
+    if auto:
+        # Lightweight page refresh (reloads the app) every poll_seconds
+        # This is simple and Cloud-friendly. Turn off if you prefer manual.
+        st.markdown(
+            f"<meta http-equiv='refresh' content='{int(poll_seconds)}'>",
+            unsafe_allow_html=True,
+        )
+        st.caption(f"Auto-refresh every {int(poll_seconds)}s (polite to Sleeper API).")
+
     if not league_id:
         st.info("Add your Sleeper League ID in the sidebar, then click **Save Settings**.")
     else:
-        # polite auto-refresh
-        st.caption(f"Auto-refresh every {int(poll_seconds)}s (polite to Sleeper API).")
-        st_autorefresh_event = st.experimental_rerun  # placeholder if needed
-        st.autorefresh(interval=int(poll_seconds) * 1000, key="live_autorefresh")
-
         # Pull league & draft
         league_info = sleeper.get_league_info(league_id)
         if not league_info:
@@ -186,7 +196,7 @@ with tab_mock:
         value=int(config.get("draft", {}).get("rounds", 15)),
         key="mock_num_rounds",
     )
-    c_start, c_pause, c_reset = st.columns([1,1,1])
+    c_start, c_pause, c_reset = st.columns([1, 1, 1])
     start = c_start.button("Start / Resume", key="mock_start")
     pause = c_pause.button("Pause", key="mock_pause")
     reset = c_reset.button("Reset", key="mock_reset")
