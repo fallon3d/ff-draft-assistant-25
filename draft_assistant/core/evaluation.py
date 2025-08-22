@@ -54,6 +54,7 @@ def _compute_vbd(df: pd.DataFrame, teams: int, starters: Dict[str,int]) -> pd.Se
         if sub.empty: continue
         idx = min(_baseline_index(pos, teams, starters), len(sub))
         baseline = float(sub.iloc[idx-1]["value_raw"])
+        vbd.loc=sub.index
         vbd.loc[sub.index] = sub["value_raw"] - baseline
     return vbd
 
