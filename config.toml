@@ -27,7 +27,19 @@ sleeper_username = "Fallon3D"
 user_slot = 0
 
 [strategy]
+# default high-level preference (honored if within ~5% of the best option)
 default_strategy = "Hero RB + WR Flood (optional early TE)"
+
+# thresholds used by the lookahead strategy model
 elite_te_value = 78.0
 hero_rb_value = 85.0
+
+# draft K/DST very late
 kd_only_last_round = true
+
+# --- NEW knobs for QB/TE/stack behavior & punting (used by suggestions.py) ---
+early_qb_round = 7          # prefer waiting on QB until round 7 unless elite or stack leverage
+early_te_round = 6          # prefer waiting on TE until round 6 unless elite
+elite_qb_pos_rank = 3       # treat top-3 at QB as "elite window" if available early
+stack_bonus = 0.06          # +6% score when a pick creates or completes a stack you already have
+punt_positions = []         # e.g., ["QB"] if you truly want to punt QB into the late rounds
