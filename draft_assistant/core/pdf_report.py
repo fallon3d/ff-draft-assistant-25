@@ -1,55 +1,43 @@
 """
-PDF report generation for draft summary.
+Simple PDF report via ReportLab.
 """
-import io
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
 
-def generate_pdf(league_name, picks, user_slot):
-    """
-    Generate a PDF report of the draft.
-    """
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
+from __future__ import annotations
+from io import BytesIO
+from typing import List, Optional
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
 
-    # Cover page
-    c.setFont("Helvetica-Bold", 20)
-    c.drawCentredString(width/2, height-100, league_name or "Draft Report")
-    c.setFont("Helvetica", 12)
-    c.drawCentredString(width/2, height-130, f"Team Slot: {user_slot}")
-    from datetime import datetime
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    c.drawCentredString(width/2, height-150, date_str)
-    c.showPage()
+def generate_pdf(league_name: str, picks_log: List[dict], my_slot: Optional[int]) -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    elems = []
 
-    # Picks page
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, height-50, "Draft Picks")
-    c.setFont("Helvetica", 10)
-    y = height - 80
-    c.drawString(50, y, "Round")
-    c.drawString(100, y, "Pick")
-    c.drawString(140, y, "Team")
-    c.drawString(240, y, "Player")
-    y -= 20
-    for pick in picks:
-        if y < 50:
-            c.showPage()
-            y = height - 50
-        rnd = str(pick.get("round"))
-        pk = str(pick.get("pick_no"))
-        team = pick.get("team", "Unknown")
-        meta = pick.get("metadata", {})
-        player = f"{meta.get('first_name', '')} {meta.get('last_name', '')}"
-        player = player.strip()
-        c.drawString(50, y, rnd)
-        c.drawString(100, y, pk)
-        c.drawString(140, y, team)
-        c.drawString(240, y, player)
-        y -= 15
+    title = f"Draft Report — {league_name}"
+    elems.append(Paragraph(title, styles["Title"]))
+    if my_slot:
+        elems.append(Paragraph(f"Your slot: {my_slot}", styles["Normal"]))
+    elems.append(Spacer(1, 12))
 
-    c.save()
-    pdf = buffer.getvalue()
-    buffer.close()
-    return pdf
+    # Pick log table
+    data = [["Round", "Pick", "Team", "Player", "Pos"]]
+    for p in picks_log or []:
+        meta = p.get("metadata") or {}
+        nm = f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()
+        data.append([p.get("round"), p.get("pick_no"), p.get("team",""), nm, (meta.get("position") or "")])
+
+    tbl = Table(data, hAlign="LEFT")
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#222222")),
+        ("TEXTCOLOR",(0,0),(-1,0),colors.white),
+        ("GRID",(0,0),(-1,-1),0.25,colors.grey),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.whitesmoke, colors.lightgrey]),
+    ]))
+    elems.append(tbl)
+
+    doc.build(elems)
+    return buf.getvalue()
