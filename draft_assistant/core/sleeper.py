@@ -73,60 +73,53 @@ def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
         https://sleeper.com/draft/board/123...
     """
     s = str(url_or_id).strip()
-    # Raw id?
     if re.fullmatch(r"[A-Za-z0-9_]{10,24}", s):
         return s
-
-    # Common shapes
     m = re.search(r"/draft/(?:nfl/|board/)?([A-Za-z0-9_]{10,24})", s)
     if m:
         return m.group(1)
-
-    # Fallback: longest plausible token
     candidates = re.findall(r"([A-Za-z0-9_]{10,24})", s)
     if candidates:
         candidates.sort(key=len, reverse=True)
         return candidates[0]
-
     return None
+
+
+# ---------------- Helpers ----------------
+def _slot_from_round_pick(round_number: int, pick_in_round: int, teams: int) -> int:
+    """Snake draft slot for a given (round, pick_in_round)."""
+    if round_number % 2 == 1:
+        return int(pick_in_round)
+    return int(teams) - int(pick_in_round) + 1
 
 
 # ---------------- Picks conversion ----------------
 def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | None = None) -> List[dict]:
     """
     Convert Sleeper picks to our simple structure:
-      {round, pick_no, team, metadata:{first_name,last_name,position}}
-    Tries multiple fields and computes round/pick_no from 'pick' if needed (when teams provided).
+      {round, pick_no, slot, roster_id, team, metadata:{first_name,last_name,position}}
+    Prefer Sleeper's 'draft_slot' -> slot/roster_id; if missing, compute via snake math.
     """
     out = []
     for p in picks or []:
         meta = p.get("metadata") or {}
         pid = p.get("player_id")
-        # Name from metadata, otherwise from players_map
-        first, last = meta.get("first_name", ""), meta.get("last_name", "")
-        if (not first and not last) and pid and pid in players_map:
-            pm = players_map[pid] or {}
-            first = pm.get("first_name", "") or ""
-            last = pm.get("last_name", "") or ""
-            meta["position"] = meta.get("position") or pm.get("position")
-        # Position fallback from players_map
-        if not meta.get("position") and pid and pid in players_map:
-            meta["position"] = (players_map[pid] or {}).get("position")
 
-        # Round / pick_no
+        # Name/pos from metadata, fallback to players map
+        first = (meta.get("first_name") or "").strip()
+        last = (meta.get("last_name") or "").strip()
+        position = (meta.get("position") or "").strip()
+        if (not first and not last) and pid and pid in players_map:
+            pm = players_map.get(pid) or {}
+            first = (pm.get("first_name") or "").strip() or first
+            last = (pm.get("last_name") or "").strip() or last
+            position = position or (pm.get("position") or "").strip()
+        if not position and pid and pid in players_map:
+            position = (players_map.get(pid) or {}).get("position")
+
+        # Round/pick & slot
         rnd = p.get("round")
         pick_no = p.get("pick_no")
-        overall = p.get("pick")  # some rooms provide 'pick' as overall number
-
-        if (rnd is None or pick_no is None) and overall and teams:
-            try:
-                overall_i = int(overall)
-                teams_i = int(teams)
-                rnd = (overall_i - 1) // teams_i + 1
-                pick_no = (overall_i - 1) % teams_i + 1
-            except Exception:
-                pass
-
         try:
             rnd = int(rnd) if rnd is not None else 0
         except Exception:
@@ -136,15 +129,24 @@ def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | Non
         except Exception:
             pick_no = 0
 
+        slot = p.get("draft_slot")
+        try:
+            slot = int(slot) if slot is not None else None
+        except Exception:
+            slot = None
+
+        if slot is None and teams and rnd and pick_no:
+            slot = _slot_from_round_pick(rnd, pick_no, int(teams))
+        if slot is None:
+            slot = 0  # as a last resort, 0 (will be ignored in roster grouping)
+
         out.append({
             "round": rnd,
             "pick_no": pick_no,
+            "slot": int(slot),
+            "roster_id": int(slot),
             "team": p.get("picked_by") or "",
-            "metadata": {
-                "first_name": first,
-                "last_name": last,
-                "position": meta.get("position"),
-            },
+            "metadata": {"first_name": first, "last_name": last, "position": position},
         })
     return out
 
@@ -154,10 +156,6 @@ def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
     """
     Build a set of drafted player names as strings that match our CSV 'PLAYER' field
     as closely as possible: 'First Last' when available, falling back to /players/nfl map.
-
-    For DST/K edge cases we also try:
-      - metadata.name (if provided)
-      - players_map[pid]['full_name'] or ['last_name'] or ['first_name']
     """
     out: set[str] = set()
     for p in picks or []:
@@ -168,7 +166,6 @@ def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
         last = (meta.get("last_name") or "").strip()
         full = f"{first} {last}".strip()
 
-        # Fallbacks via players_map
         if not full and pid and players_map:
             pm = players_map.get(pid) or {}
             pf = (pm.get("first_name") or "").strip()
@@ -178,7 +175,6 @@ def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
             else:
                 full = (pm.get("full_name") or pm.get("name") or "").strip()
 
-        # Last resort: metadata 'name'
         if not full:
             full = (meta.get("name") or "").strip()
 
