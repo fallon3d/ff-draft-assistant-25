@@ -1,35 +1,31 @@
 """
-Roster and draft board management.
+Build team rosters grouped by position from pick data.
 """
-def build_rosters(picks, users):
+
+from __future__ import annotations
+from typing import List, Dict
+
+def build_rosters(picks: List[dict], users: List[dict]) -> Dict[str, Dict[str, List[str]]]:
     """
-    Given list of pick dicts and list of user dicts (with 'roster_id' and 'display_name'),
-    return a dict mapping team names to roster lists by position.
+    picks: list of {roster_id, metadata:{first_name,last_name,position}}
+    users: from Sleeper users endpoint (contains roster_id + display name)
+    returns: {team_display_name: {POS: [players...]}}
     """
-    # Build roster_id to team name mapping
-    roster_map = {}
-    for user in users:
-        name = user.get("display_name") or user.get("username") or f"Team {user.get('roster_id', '')}"
-        roster_id = user.get("roster_id")
-        roster_map[str(roster_id)] = name
-    
-    # Initialize team rosters
-    teams = {}
-    for rid, name in roster_map.items():
-        teams[name] = {"QB": [], "RB": [], "WR": [], "TE": [], "Other": []}
-    
-    # Fill rosters based on picks
-    for pick in picks:
-        rid = str(pick.get("roster_id"))
-        team_name = roster_map.get(rid, f"Team {rid}")
-        position = pick.get("metadata", {}).get("position")
-        first = pick.get("metadata", {}).get("first_name", "")
-        last = pick.get("metadata", {}).get("last_name", "")
-        player_name = f"{first} {last}".strip()
-        if not player_name:
-            player_name = pick.get("metadata", {}).get("name", "")
-        if position in teams.get(team_name, {}):
-            teams[team_name][position].append(player_name)
-        else:
-            teams[team_name]["Other"].append(player_name)
-    return teams
+    roster_id_to_name = {}
+    for u in users or []:
+        rid = int(u.get("roster_id", 0))
+        nm = u.get("metadata", {}).get("team_name") or u.get("display_name") or f"Slot {rid}"
+        roster_id_to_name[rid] = nm
+
+    team_maps: Dict[str, Dict[str, List[str]]] = {}
+    for p in picks or []:
+        rid = int(p.get("roster_id", 0))
+        team = roster_id_to_name.get(rid, f"Slot {rid}")
+        meta = p.get("metadata") or {}
+        pos = str(meta.get("position") or "").upper()
+        if pos in ("DEF","D/ST","D-ST","TEAM D","TEAM DEF","DEFENSE"): pos = "DST"
+        nm = f"{meta.get('first_name','')} {meta.get('last_name','')}".strip() or meta.get("name","")
+        team_maps.setdefault(team, {})
+        team_maps[team].setdefault(pos, [])
+        if nm: team_maps[team][pos].append(nm)
+    return team_maps
