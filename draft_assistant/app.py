@@ -150,6 +150,7 @@ if st.sidebar.button("Save Settings"):
     config["strategy"]["elite_te_value"] = float(elite_te_value)
     config["strategy"]["hero_rb_value"] = float(hero_rb_value)
     config["strategy"]["kd_only_last_round"] = bool(kd_only_last_round)
+    # keep other strategy knobs from config.toml as-is (early QB/TE, stack_bonus, punt_positions)
     config.setdefault("scoring", {})
     config["scoring"]["w_proj"] = float(w_proj)
     config["scoring"]["w_vbd"] = float(w_vbd)
@@ -267,6 +268,7 @@ with tab_live:
                 )
                 st.info(f"**Recommended strategy now:** {strat['name']} — {strat['why']}")
 
+                # ---- UPDATED: pass universe_df & config ----
                 ranked = suggestions.rank_suggestions(
                     evaluated,
                     round_number=rnd, total_rounds=int(rounds_setting),
@@ -277,6 +279,8 @@ with tab_live:
                     user_bye_weeks=your_bye_weeks,
                     weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                                  w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
+                    universe_df=full_pool,   # NEW
+                    config=config,           # NEW
                 ).head(8)
 
                 if ranked.empty:
@@ -418,6 +422,7 @@ with tab_mock:
         )
         st.info(f"**Recommended strategy now:** {strat['name']} — {strat['why']}")
 
+        # ---- UPDATED: pass universe_df & config ----
         ranked = suggestions.rank_suggestions(
             S["available"], round_number=rnd, total_rounds=rounds,
             user_picked_names=my_names, pick_log=pick_log, teams=teams,
@@ -427,6 +432,8 @@ with tab_mock:
             user_bye_weeks=my_bye_weeks,
             weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                          w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
+            universe_df=S.get("full_pool", build_pool(full=True)),  # NEW
+            config=config,                                           # NEW
         ).head(8)
 
         if ranked.empty:
@@ -475,6 +482,7 @@ with tab_suggest:
     base_df = build_pool(full=True)
     evaluated = evaluation.evaluate_players(base_df, config, teams=int(teams_setting), rounds=int(rounds_setting), weight_proj=float(w_proj))
     st.info(suggestions.needs_summary(evaluated, [], user_pos_counts={"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DST":0}) or "")
+    # ---- UPDATED: pass universe_df & config ----
     ranked = suggestions.rank_suggestions(
         evaluated, round_number=1, total_rounds=int(rounds_setting),
         user_picked_names=[], pick_log=[], teams=int(teams_setting),
@@ -484,6 +492,8 @@ with tab_suggest:
         user_bye_weeks=set(),
         weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                      w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
+        universe_df=base_df,   # NEW
+        config=config,         # NEW
     ).head(8)
     for _, row in ranked.iterrows():
         tag = row.get("next_turn_tag", "")
