@@ -54,46 +54,84 @@ def get_players_nfl() -> Optional[dict]:
     TTL_SECONDS = old_ttl
     return data or {}
 
-def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
+# ---- FIX 1: Robust draft_id parsing for mock URLs ----
+def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
     """
-    Convert Sleeper player_ids in picks to a set of display names using players_map.
-    Falls back to metadata names if needed.
+    Accepts:
+      - Raw draft_id (all digits/letters)
+      - URLs like:
+        https://sleeper.com/draft/123...
+        https://sleeper.com/draft/nfl/123...
+        https://sleeper.com/draft/board/123...
+    Strategy: Prefer the longest 12-22 char alnum token at the end or anywhere in path.
     """
-    out = set()
-    for p in picks or []:
-        pid = p.get("player_id")
-        meta = p.get("metadata") or {}
-        if pid and players_map and pid in players_map:
-            pm = players_map[pid]
-            dn = (pm.get("full_name") or f"{pm.get('first_name','')} {pm.get('last_name','')}".strip()).strip()
-            if dn: out.add(dn)
-        else:
-            # fallback
-            name = (meta.get("full_name") or f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()).strip()
-            if name: out.add(name)
-    return out
+    s = str(url_or_id).strip()
+    # If user pasted a raw id, accept it
+    if re.fullmatch(r"[A-Za-z0-9_]{10,24}", s):
+        return s
 
-def parse_draft_id_from_url(url: str) -> Optional[str]:
-    m = re.search(r"/draft/([A-Za-z0-9_]+)", url)
-    return m.group(1) if m else None
+    # Try common path shapes
+    m = re.search(r"/draft/(?:nfl/|board/)?([A-Za-z0-9_]{10,24})", s)
+    if m:
+        return m.group(1)
 
-def picks_to_internal_log(picks: List[dict], players_map: dict) -> List[dict]:
+    # Fallback: pick the longest plausible id-looking token
+    candidates = re.findall(r"([A-Za-z0-9_]{10,24})", s)
+    if candidates:
+        candidates.sort(key=len, reverse=True)
+        return candidates[0]
+
+    return None
+
+# ---- FIX 2: More defensive picks -> internal log conversion ----
+def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | None = None) -> List[dict]:
     """
     Convert Sleeper picks to our simple structure:
-    {round, pick_no, team, metadata:{first_name,last_name,position}}
+      {round, pick_no, team, metadata:{first_name,last_name,position}}
+    Tries multiple fields and computes round/pick_no from 'pick' if needed (and teams provided).
     """
     out = []
     for p in picks or []:
         meta = p.get("metadata") or {}
         pid = p.get("player_id")
+        # Name
         first, last = meta.get("first_name",""), meta.get("last_name","")
         if (not first and not last) and pid and pid in players_map:
             pm = players_map[pid]
             first, last = pm.get("first_name",""), pm.get("last_name","")
-            meta["position"] = pm.get("position")
+            meta["position"] = meta.get("position") or pm.get("position")
+        # Position fallback from players_map
+        if not meta.get("position") and pid and pid in players_map:
+            meta["position"] = players_map[pid].get("position")
+
+        # Round / pick_no
+        rnd = p.get("round")
+        pick_no = p.get("pick_no")
+        overall = p.get("pick")  # Sleeper sometimes provides this
+
+        if (rnd is None or pick_no is None) and overall and teams:
+            try:
+                overall_i = int(overall)
+                teams_i = int(teams)
+                rnd = (overall_i - 1) // teams_i + 1
+                # pick number within round in SNAKE is not overall%teams; but Sleeper 'pick_no' is usually 1..teams
+                # We set pick_no = position within round order (1..teams) – true for linear round order metadata.
+                pick_no = (overall_i - 1) % teams_i + 1
+            except Exception:
+                pass
+
+        try:
+            rnd = int(rnd) if rnd is not None else 0
+        except Exception:
+            rnd = 0
+        try:
+            pick_no = int(pick_no) if pick_no is not None else 0
+        except Exception:
+            pick_no = 0
+
         out.append({
-            "round": int(p.get("round", 0)),
-            "pick_no": int(p.get("pick_no", p.get("pick", 0))),
+            "round": rnd,
+            "pick_no": pick_no,
             "team": p.get("picked_by") or "",
             "metadata": {"first_name": first, "last_name": last, "position": meta.get("position")},
         })
