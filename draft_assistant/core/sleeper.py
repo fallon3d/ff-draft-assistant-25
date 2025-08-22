@@ -54,7 +54,7 @@ def get_players_nfl() -> Optional[dict]:
     TTL_SECONDS = old_ttl
     return data or {}
 
-# ---- FIX 1: Robust draft_id parsing for mock URLs ----
+# ---- Robust draft_id parsing for mock URLs ----
 def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
     """
     Accepts:
@@ -63,19 +63,19 @@ def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
         https://sleeper.com/draft/123...
         https://sleeper.com/draft/nfl/123...
         https://sleeper.com/draft/board/123...
-    Strategy: Prefer the longest 12-22 char alnum token at the end or anywhere in path.
+    Strategy: Prefer the longest 10–24 char alnum token at the end or anywhere in path.
     """
     s = str(url_or_id).strip()
-    # If user pasted a raw id, accept it
+    # Raw id?
     if re.fullmatch(r"[A-Za-z0-9_]{10,24}", s):
         return s
 
-    # Try common path shapes
+    # Common shapes
     m = re.search(r"/draft/(?:nfl/|board/)?([A-Za-z0-9_]{10,24})", s)
     if m:
         return m.group(1)
 
-    # Fallback: pick the longest plausible id-looking token
+    # Fallback: longest plausible id-looking token
     candidates = re.findall(r"([A-Za-z0-9_]{10,24})", s)
     if candidates:
         candidates.sort(key=len, reverse=True)
@@ -83,7 +83,7 @@ def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
 
     return None
 
-# ---- FIX 2: More defensive picks -> internal log conversion ----
+# ---- Defensive picks -> internal log conversion ----
 def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | None = None) -> List[dict]:
     """
     Convert Sleeper picks to our simple structure:
@@ -114,8 +114,6 @@ def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | Non
                 overall_i = int(overall)
                 teams_i = int(teams)
                 rnd = (overall_i - 1) // teams_i + 1
-                # pick number within round in SNAKE is not overall%teams; but Sleeper 'pick_no' is usually 1..teams
-                # We set pick_no = position within round order (1..teams) – true for linear round order metadata.
                 pick_no = (overall_i - 1) % teams_i + 1
             except Exception:
                 pass
