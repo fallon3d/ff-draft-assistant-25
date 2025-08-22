@@ -1,12 +1,8 @@
 """
-Fantasy Football Draft Assistant (Streamlit)
-
-- Single master player file (CSV or Excel) consumed for both Live + Mock.
-- Dynamic suggestions: weighted VBD + heuristics + ECR vs ADP + schedule + risk.
-- Strategy picker re-evaluates EVERY PICK (not just Round 1).
-- Team rosters are collapsed beneath Suggestions.
-- Needs counters use ACTUAL picks-by-position (QB/RB/WR/TE/K/DST).
-- Bye conflict note (light penalty) & "likely gone/might make it".
+Fantasy Football Draft Assistant (Streamlit) — Strategy-locked flow
+- On your FIRST PICK only: show Top-3 strategy options to choose from, then lock it.
+- No BPA strategy; suggestions honor your locked strategy from then on.
+- Strong QB suppression when you already have enough QBs.
 """
 
 import os
@@ -24,6 +20,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ---------- Config ----------
 config = utils.read_config()
 league_info = None
+
+# Keep chosen strategy in session
+if "selected_strategy" not in st.session_state:
+    st.session_state.selected_strategy = None
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Settings")
@@ -64,25 +64,6 @@ rounds_setting = st.sidebar.number_input(
 
 # Strategy tuning
 st.sidebar.markdown("### Strategy")
-available_default_strats = [
-    "Anchor WR + Early Elite TE (default)",
-    "Modified Zero RB (triple WR + TE, then attack RBs)",
-    "Hero RB + WR Flood (optional early TE)",
-]
-default_strategy_current = str(
-    config.get("strategy", {}).get("default_strategy", "Hero RB + WR Flood (optional early TE)")
-)
-default_strategy_index = (
-    available_default_strats.index(default_strategy_current)
-    if default_strategy_current in available_default_strats else 2
-)
-default_strategy = st.sidebar.selectbox(
-    "Default Strategy (tie-breaker)",
-    options=available_default_strats,
-    index=default_strategy_index,
-    key="default_strategy_select",
-)
-
 elite_te_value = st.sidebar.number_input(
     "Elite TE threshold (value)", min_value=10.0, max_value=160.0,
     value=float(config.get("strategy", {}).get("elite_te_value", 78.0)),
@@ -98,6 +79,10 @@ kd_only_last_round = st.sidebar.checkbox(
     value=bool(config.get("strategy", {}).get("kd_only_last_round", True)),
     key="kd_only_last_round",
 )
+
+if st.sidebar.button("Reset Locked Strategy (next first pick)"):
+    st.session_state.selected_strategy = None
+    st.sidebar.success("Strategy reset — you'll choose again on your next first pick.")
 
 # Advanced scoring sliders
 st.sidebar.markdown("### Weighted Scoring (advanced)")
@@ -126,7 +111,7 @@ def _save_master(upload):
     content = upload.read()
     with open(MASTER_PATH, "wb") as f:
         f.write(content)
-    df = utils.read_player_table(MASTER_PATH)  # handles csv/xlsx + normalization
+    df = utils.read_player_table(MASTER_PATH)
     df.to_csv(CSV_MIRROR, index=False)
     st.sidebar.success("Players file saved and normalized.")
 
@@ -148,11 +133,9 @@ if st.sidebar.button("Save Settings"):
     config.setdefault("draft", {})["teams"] = int(teams_setting)
     config["draft"]["rounds"] = int(rounds_setting)
     config.setdefault("strategy", {})
-    config["strategy"]["default_strategy"] = default_strategy
     config["strategy"]["elite_te_value"] = float(elite_te_value)
     config["strategy"]["hero_rb_value"] = float(hero_rb_value)
     config["strategy"]["kd_only_last_round"] = bool(kd_only_last_round)
-    # keep other strategy knobs from config.toml as-is (early QB/TE, stack_bonus, punt_positions)
     config.setdefault("scoring", {})
     config["scoring"]["w_proj"] = float(w_proj)
     config["scoring"]["w_vbd"] = float(w_vbd)
@@ -211,7 +194,6 @@ with tab_live:
     if c2.button("Refresh now"):
         st.rerun()
     if auto:
-        # Streamlit-safe meta refresh
         st.markdown(f"<meta http-equiv='refresh' content='{int(poll_seconds)}'>", unsafe_allow_html=True)
         st.caption(f"Auto-refresh every {int(poll_seconds)}s.")
 
@@ -259,19 +241,27 @@ with tab_live:
                 your_pos_counts = _user_pos_counts_from_live_picks(picks, live_user_slot)
                 your_bye_weeks = utils.lookup_bye_weeks(full_pool, your_names)
 
-                needs_text = suggestions.needs_summary(evaluated, your_names, user_pos_counts=your_pos_counts)
-                if needs_text:
-                    st.info(needs_text)
+                # ---------- FIRST PICK: choose strategy ----------
+                if st.session_state.selected_strategy is None and you_on_clock and rnd == 1:
+                    st.markdown("### Choose Your Draft Strategy")
+                    top3 = suggestions.top_strategies(
+                        evaluated, current_overall=next_overall, user_slot=live_user_slot,
+                        teams=int(teams_setting), total_rounds=int(rounds_setting),
+                        elite_te_value=float(elite_te_value), hero_rb_value=float(hero_rb_value),
+                        k=3, config=config,
+                    )
+                    for i, srec in enumerate(top3, start=1):
+                        st.write(f"{i}. **{srec['name']}** — {srec['why']} (board score {srec['score']:.1f})")
+                    all_names = [meta["name"] for meta in suggestions.STRATS.values()]
+                    choice = st.selectbox("Lock a strategy for the rest of the draft", options=all_names, index=all_names.index(top3[0]["name"]) if top3 else 0)
+                    if st.button("Lock Strategy"):
+                        st.session_state.selected_strategy = choice
+                        st.success(f"Locked: {choice}")
 
-                # Dynamic strategy EVERY pick
-                strat = suggestions.choose_strategy(
-                    evaluated, current_overall=next_overall, user_slot=live_user_slot,
-                    teams=int(teams_setting), total_rounds=int(rounds_setting),
-                    elite_te_value=float(elite_te_value), hero_rb_value=float(hero_rb_value),
-                    preferred_name=default_strategy,
-                )
-                st.info(f"**Recommended strategy now:** {strat['name']} — {strat['why']}")
+                if st.session_state.selected_strategy:
+                    st.info(f"**Locked strategy:** {st.session_state.selected_strategy}")
 
+                # Suggestions (respect locked strategy)
                 ranked = suggestions.rank_suggestions(
                     evaluated,
                     round_number=rnd, total_rounds=int(rounds_setting),
@@ -282,10 +272,12 @@ with tab_live:
                     user_bye_weeks=your_bye_weeks,
                     weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                                  w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
-                    universe_df=full_pool,   # for stacking/handcuff lookups
-                    config=config,           # early QB/TE, punt positions, etc.
+                    universe_df=full_pool,
+                    config=config,
+                    selected_strategy_name=st.session_state.selected_strategy,
                 ).head(8)
 
+                st.markdown("### Suggestions for This Pick")
                 if ranked.empty:
                     st.info("No candidates available.")
                 else:
@@ -314,7 +306,6 @@ with tab_live:
 with tab_mock:
     st.subheader("Mock Draft (Practice Mode)")
 
-    # Accept either a full Sleeper URL or just the draft_id
     mock_url = st.text_input(
         "Sleeper Mock URL or draft_id",
         value="",
@@ -334,31 +325,26 @@ with tab_mock:
     if load_btn and mock_url.strip():
         draft_id = sleeper.parse_draft_id_from_url(mock_url.strip())
         if not draft_id:
-            st.error("Could not parse a draft_id from your input. Paste a full Sleeper URL or the id itself.")
+            st.error("Could not parse a draft_id from your input.")
         else:
             picks = sleeper.get_picks(draft_id) or []
             dmeta = sleeper.get_draft(draft_id) or {}
             teams_from_api = int(dmeta.get("settings", {}).get("teams", config.get("draft", {}).get("teams", 12)) or dmeta.get("teams", 12))
             rounds_from_api = int(dmeta.get("settings", {}).get("rounds", config.get("draft", {}).get("rounds", 15)))
 
-            # Some mock endpoints don't have full 'users'; fall back to generic labels.
             users = dmeta.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams_from_api+1)]
 
-            # Build availability by removing picked names
             players_map = sleeper.get_players_nfl() or {}
             picked_names = sleeper.picked_player_names(picks, players_map)
             available = utils.remove_players_by_name(full_pool.copy(), picked_names)
 
-            # Evaluate pool
             evaluated = evaluation.evaluate_players(
                 available, config, teams=teams_from_api, rounds=rounds_from_api, weight_proj=float(w_proj)
             )
 
-            # Your slot detection (fallback to 1 if unknown)
             detected_slot = utils.user_roster_id(users, sleeper_username)
             my_slot = int(user_slot_override) if int(user_slot_override) > 0 else (detected_slot or 1)
 
-            # Robust picks conversion (use teams to infer round/pick_no if needed) and carry slot
             pick_log = sleeper.picks_to_internal_log(picks, players_map, teams_from_api)
 
             st.session_state.mock_state = {
@@ -374,8 +360,6 @@ with tab_mock:
             }
 
             st.success(f"Mock {draft_id} loaded — {len(picks)} picks synced, teams={teams_from_api}, rounds={rounds_from_api}.")
-            if len(picks) == 0:
-                st.warning("No picks found yet. If the mock room just opened, make/observe a pick and click 'Load / Re-sync Mock' again.")
 
     if "mock_state" in st.session_state:
         S = st.session_state.mock_state
@@ -409,7 +393,27 @@ with tab_mock:
             st.session_state.mock_state = S
             st.rerun()
 
-        # Suggestions
+        # ---------- FIRST PICK: choose strategy ----------
+        if st.session_state.selected_strategy is None and you_on_clock and rnd == 1:
+            st.markdown("### Choose Your Draft Strategy")
+            top3 = suggestions.top_strategies(
+                S["available"], current_overall=next_overall, user_slot=S.get("your_roster_id"),
+                teams=teams, total_rounds=rounds,
+                elite_te_value=float(elite_te_value), hero_rb_value=float(hero_rb_value),
+                k=3, config=config,
+            )
+            for i, srec in enumerate(top3, start=1):
+                st.write(f"{i}. **{srec['name']}** — {srec['why']} (board score {srec['score']:.1f})")
+            all_names = [meta["name"] for meta in suggestions.STRATS.values()]
+            choice = st.selectbox("Lock a strategy for the rest of the draft", options=all_names, index=all_names.index(top3[0]["name"]) if top3 else 0, key="mock_strategy_choice")
+            if st.button("Lock Strategy (mock)"):
+                st.session_state.selected_strategy = choice
+                st.success(f"Locked: {choice}")
+
+        if st.session_state.selected_strategy:
+            st.info(f"**Locked strategy:** {st.session_state.selected_strategy}")
+
+        # Suggestions (respect locked strategy)
         st.markdown("### Suggestions for This Pick")
         my_names = [
             (p.get("metadata") or {}).get("first_name", "")
@@ -418,19 +422,6 @@ with tab_mock:
         ]
         my_pos_counts = _user_pos_counts_from_mock_log(pick_log, S.get("your_roster_id"), teams)
         my_bye_weeks = utils.lookup_bye_weeks(S.get("full_pool", build_pool(full=True)), my_names)
-
-        needs_text = suggestions.needs_summary(S["available"], my_names, user_pos_counts=my_pos_counts)
-        if needs_text:
-            st.info(needs_text)
-
-        # Dynamic strategy EVERY pick
-        strat = suggestions.choose_strategy(
-            S["available"], current_overall=next_overall, user_slot=S.get("your_roster_id"),
-            teams=teams, total_rounds=rounds,
-            elite_te_value=float(elite_te_value), hero_rb_value=float(hero_rb_value),
-            preferred_name=default_strategy,
-        )
-        st.info(f"**Recommended strategy now:** {strat['name']} — {strat['why']}")
 
         ranked = suggestions.rank_suggestions(
             S["available"], round_number=rnd, total_rounds=rounds,
@@ -443,6 +434,7 @@ with tab_mock:
                          w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
             universe_df=S.get("full_pool", build_pool(full=True)),
             config=config,
+            selected_strategy_name=st.session_state.selected_strategy,
         ).head(8)
 
         if ranked.empty:
@@ -453,7 +445,6 @@ with tab_mock:
                 st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f} {tag}")
                 st.caption(row['why'])
 
-        # ---------- FIXED INDENTATION + SLOT MAPPING ----------
         with st.expander("Team Rosters (by position)", expanded=False):
             users = S.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams+1)]
             simple_picks = []
@@ -497,7 +488,8 @@ with tab_suggest:
     st.subheader("Global Suggestions Snapshot")
     base_df = build_pool(full=True)
     evaluated = evaluation.evaluate_players(base_df, config, teams=int(teams_setting), rounds=int(rounds_setting), weight_proj=float(w_proj))
-    st.info(suggestions.needs_summary(evaluated, [], user_pos_counts={"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DST":0}) or "")
+    label = suggestions.needs_summary(evaluated, [], user_pos_counts={"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DST":0}) or ""
+    if label: st.info(label)
     ranked = suggestions.rank_suggestions(
         evaluated, round_number=1, total_rounds=int(rounds_setting),
         user_picked_names=[], pick_log=[], teams=int(teams_setting),
@@ -509,6 +501,7 @@ with tab_suggest:
                      w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
         universe_df=base_df,
         config=config,
+        selected_strategy_name=st.session_state.selected_strategy,
     ).head(8)
     for _, row in ranked.iterrows():
         tag = row.get("next_turn_tag", "")
