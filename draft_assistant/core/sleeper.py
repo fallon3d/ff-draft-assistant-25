@@ -1,138 +1,100 @@
 """
-Sleeper API helpers, including players and mock parsing.
-Adds K and DST support (maps DEF -> DST).
+Sleeper public API helpers (read-only)
 """
+
+from __future__ import annotations
 import re
 import time
+from typing import Any, Dict, List, Optional
 import requests
-import pandas as pd
 
-API_BASE = "https://api.sleeper.app/v1"
-TIMEOUT = 12
-_cache = {}
+BASE = "https://api.sleeper.app/v1"
+HTTP_TIMEOUT = 10.0
 
-def _cache_get(key, ttl=5):
-    data = _cache.get(key)
-    if not data: return None
-    ts, val = data
-    if time.time() - ts > ttl: return None
-    return val
+# Naive in-memory cache (path -> (timestamp, data))
+_CACHE: Dict[str, tuple[float, Any]] = {}
+TTL_SECONDS = 30.0
 
-def _cache_set(key, val): _cache[key] = (time.time(), val)
-
-def _get_json(url):
+def _get(path: str) -> Any:
+    now = time.time()
+    if path in _CACHE and now - _CACHE[path][0] < TTL_SECONDS:
+        return _CACHE[path][1]
+    url = f"{BASE}{path}"
     try:
-        r = requests.get(url, timeout=TIMEOUT); r.raise_for_status()
-        return r.json()
+        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        _CACHE[path] = (now, data)
+        return data
     except Exception:
         return None
 
-def get_league_info(league_id: str):
-    key = f"league:{league_id}"; c = _cache_get(key, ttl=30)
-    if c is not None: return c
-    data = _get_json(f"{API_BASE}/league/{league_id}")
-    if not data: return None
-    out = {
-        "league_id": data.get("league_id"),
-        "name": data.get("name"),
-        "draft_id": data.get("draft_id"),
-        "total_rosters": data.get("total_rosters"),
-        "settings": data.get("settings"),
-    }
-    _cache_set(key, out); return out
+def get_league_info(league_id: str) -> Optional[dict]:
+    return _get(f"/league/{league_id}")
 
-def get_drafts_for_league(league_id: str):
-    key = f"drafts:{league_id}"; c = _cache_get(key, ttl=30)
-    if c is not None: return c
-    data = _get_json(f"{API_BASE}/league/{league_id}/drafts")
-    if data is None: return []
-    _cache_set(key, data); return data
+def get_drafts_for_league(league_id: str) -> Optional[List[dict]]:
+    return _get(f"/league/{league_id}/drafts") or []
 
-def get_draft(draft_id: str):
-    key = f"draft:{draft_id}"; c = _cache_get(key, ttl=30)
-    if c is not None: return c
-    data = _get_json(f"{API_BASE}/draft/{draft_id}")
-    if data is None: return {}
-    _cache_set(key, data); return data
+def get_draft(draft_id: str) -> Optional[dict]:
+    return _get(f"/draft/{draft_id}")
 
-def get_picks(draft_id: str):
-    key = f"picks:{draft_id}"; c = _cache_get(key, ttl=5)
-    if c is not None: return c
-    data = _get_json(f"{API_BASE}/draft/{draft_id}/picks")
-    if data is None: return []
-    _cache_set(key, data); return data
+def get_picks(draft_id: str) -> Optional[List[dict]]:
+    return _get(f"/draft/{draft_id}/picks") or []
 
-def get_users(league_id: str):
-    key = f"users:{league_id}"; c = _cache_get(key, ttl=60)
-    if c is not None: return c
-    data = _get_json(f"{API_BASE}/league/{league_id}/users")
-    if data is None: return []
-    _cache_set(key, data); return data
+def get_users(league_id: str) -> Optional[List[dict]]:
+    return _get(f"/league/{league_id}/users") or []
 
-def get_players_nfl():
-    key = "players:nfl"; c = _cache_get(key, ttl=3600)
-    if c is not None: return c
-    data = _get_json(f"{API_BASE}/players/nfl")
-    if data is None: return {}
-    _cache_set(key, data); return data
+def get_players_nfl() -> Optional[dict]:
+    # Big payload – cache for longer
+    path = "/players/nfl"
+    global TTL_SECONDS
+    old_ttl = TTL_SECONDS
+    TTL_SECONDS = 3600.0
+    data = _get(path)
+    TTL_SECONDS = old_ttl
+    return data or {}
 
-def players_df_from_dict(players_map: dict) -> pd.DataFrame:
-    rows = []
-    for _, p in (players_map or {}).items():
-        pos = p.get("position") or (p.get("fantasy_positions") or [None])[0]
-        if pos == "DEF":  # map Sleeper DEF to DST
-            pos = "DST"
-        if pos not in ("QB","RB","WR","TE","K","DST"): 
-            continue
-        full = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
-        if not full: 
-            continue
-        team = p.get("team") or p.get("active_team") or "FA"
-        bye = p.get("bye_week") or 0
-        rookie = 1 if (p.get("rookie") or p.get("years_exp") in (0,1)) else 0
-        rows.append({
-            "RK": 999, "TIERS": "", "PLAYER": full, "TEAM": team, "POS": pos,
-            "BYE": int(bye) if str(bye).isdigit() else 0, "SOS": 0, "ADP": 0, "ROOKIE": rookie,
-        })
-    return pd.DataFrame(rows)
-
-def parse_draft_id_from_url(url: str) -> str | None:
-    if not url: return None
-    m = re.search(r"/draft/[^/]+/([A-Za-z0-9_-]+)", url) or re.search(r"/draft/([A-Za-z0-9_-]+)", url)
-    return m.group(1) if m else None
-
-def picked_player_names(picks: list, players_map: dict) -> list[str]:
-    out = []
+def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
+    """
+    Convert Sleeper player_ids in picks to a set of display names using players_map.
+    Falls back to metadata names if needed.
+    """
+    out = set()
     for p in picks or []:
-        pid = p.get("player_id"); meta = p.get("metadata") or {}
-        nm = ""
+        pid = p.get("player_id")
+        meta = p.get("metadata") or {}
         if pid and players_map and pid in players_map:
-            info = players_map[pid]
-            nm = info.get("full_name") or f"{info.get('first_name','')} {info.get('last_name','')}".strip()
-        if not nm:
-            nm = f"{meta.get('first_name','')} {meta.get('last_name','')}".strip() or meta.get("name","")
-        if nm: out.append(nm)
+            pm = players_map[pid]
+            dn = (pm.get("full_name") or f"{pm.get('first_name','')} {pm.get('last_name','')}".strip()).strip()
+            if dn: out.add(dn)
+        else:
+            # fallback
+            name = (meta.get("full_name") or f"{meta.get('first_name','')} {meta.get('last_name','')}".strip()).strip()
+            if name: out.add(name)
     return out
 
-def picks_to_internal_log(picks: list, players_map: dict) -> list[dict]:
+def parse_draft_id_from_url(url: str) -> Optional[str]:
+    m = re.search(r"/draft/([A-Za-z0-9_]+)", url)
+    return m.group(1) if m else None
+
+def picks_to_internal_log(picks: List[dict], players_map: dict) -> List[dict]:
+    """
+    Convert Sleeper picks to our simple structure:
+    {round, pick_no, team, metadata:{first_name,last_name,position}}
+    """
     out = []
     for p in picks or []:
         meta = p.get("metadata") or {}
         pid = p.get("player_id")
-        first, last, pos = "", "", meta.get("position")
-        if pid and players_map and pid in players_map:
-            info = players_map[pid]
-            full = info.get("full_name") or f"{info.get('first_name','')} {info.get('last_name','')}".strip()
-            first = full; last = ""; 
-            pos = "DST" if (pos == "DEF") else (pos or info.get("position"))
-            if pos == "DEF": pos = "DST"
-        else:
-            first = f"{meta.get('first_name','')} {meta.get('last_name','')}".strip() or meta.get("name","")
-            last = ""
+        first, last = meta.get("first_name",""), meta.get("last_name","")
+        if (not first and not last) and pid and pid in players_map:
+            pm = players_map[pid]
+            first, last = pm.get("first_name",""), pm.get("last_name","")
+            meta["position"] = pm.get("position")
         out.append({
-            "round": p.get("round"),
-            "pick_no": p.get("pick_no") or p.get("pick", 0),
-            "team": f"Roster {p.get('roster_id','?')}",
-            "metadata": {"first_name": first, "last_name": last, "position": pos},
+            "round": int(p.get("round", 0)),
+            "pick_no": int(p.get("pick_no", p.get("pick", 0))),
+            "team": p.get("picked_by") or "",
+            "metadata": {"first_name": first, "last_name": last, "position": meta.get("position")},
         })
     return out
