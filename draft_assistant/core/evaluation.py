@@ -1,106 +1,137 @@
 """
-Player evaluation with simple VBD-like scoring + schedule/coaching modifiers.
-Now includes K and DST baselines.
+Evaluation: compute projections, apply modifiers, compute VBD, and return
+a player table with:
+  - 'value' (final adjusted projection proxy)
+  - 'vbd'   (value-based-drafting vs positional baseline)
+  - tags (for downstream 'why' text)
 """
-import json
-import os
+
+from __future__ import annotations
+from typing import Dict, Any
+import math
 import pandas as pd
 
-def _load_schedule_stars() -> dict:
-    path = os.path.join(os.path.dirname(__file__), "..", "data", "sample_schedule.csv")
-    if not os.path.exists(path):
-        return {}
-    try:
-        df = pd.read_csv(path)
-        col_stars = "STARS" if "STARS" in df.columns else ("SOS" if "SOS" in df.columns else None)
-        if col_stars is None:
-            return {}
-        return dict(zip(df["TEAM"], df[col_stars]))
-    except Exception:
-        return {}
+DEFAULT_STARTERS = {"QB":1, "RB":2, "WR":3, "TE":1, "K":1, "DST":1}
 
-def _load_coaching_mods() -> dict:
-    path = os.path.join(os.path.dirname(__file__), "..", "data", "coaching_modifiers.json")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# Default scoring weights (season-long)
+DEFAULT_SCORING = {
+    "ppr": 1.0,
+    "pass_yd": 0.04, "pass_td": 4.0, "int": -2.0,      # interceptions not in sheet; ignore unless provided later
+    "rush_yd": 0.10, "rush_td": 6.0,
+    "rec": 1.0, "rec_yd": 0.10, "rec_td": 6.0,
+    "fg": 3.0, "xp": 1.0,
+    "sack": 1.0, "turnover": 2.0,                      # D/ST takeaways
+    # Points allowed buckets not modeled exactly; we use linear proxy via PROJ_POINTS_ALLOWED (downward)
+}
 
-def evaluate_players(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+SOS_MULT = {1: 0.92, 2: 0.96, 3: 1.00, 4: 1.04, 5: 1.08}  # ±8%
+
+INJURY_PEN = {"low": 0.0, "medium": -0.03, "high": -0.06}
+VOLATILITY_BONUS_LATE = {"low": 0.00, "medium": 0.02, "high": 0.04}
+
+def _coalesce(*vals, default=0.0) -> float:
+    for v in vals:
+        try:
+            if pd.notna(v):
+                return float(v)
+        except Exception:
+            pass
+    return float(default)
+
+def _proj_points_row(row: pd.Series, scoring: Dict[str, float]) -> float:
+    """Compute projection from PROJ_* fields; fall back to given PROJ_PTS."""
+    # QB/pass
+    pts = 0.0
+    pts += _coalesce(row.get("PROJ_PASS_YDS")) * scoring["pass_yd"]
+    pts += _coalesce(row.get("PROJ_PASS_TD")) * scoring["pass_td"]
+    # rush
+    pts += _coalesce(row.get("PROJ_RUSH_YDS")) * scoring["rush_yd"]
+    pts += _coalesce(row.get("PROJ_RUSH_TD")) * scoring["rush_td"]
+    # rec
+    pts += _coalesce(row.get("PROJ_REC")) * scoring["rec"]
+    pts += _coalesce(row.get("PROJ_REC_YDS")) * scoring["rec_yd"]
+    pts += _coalesce(row.get("PROJ_REC_TD")) * scoring["rec_td"]
+    # K
+    pts += _coalesce(row.get("PROJ_FG")) * scoring["fg"]
+    pts += _coalesce(row.get("PROJ_XP")) * scoring["xp"]
+    # D/ST
+    pts += _coalesce(row.get("PROJ_SACKS")) * scoring["sack"]
+    pts += _coalesce(row.get("PROJ_TURNOVERS")) * scoring["turnover"]
+    # Penalize points allowed linearly (not bucketed)
+    pts += -0.02 * _coalesce(row.get("PROJ_POINTS_ALLOWED"))  # mild penalty
+    # If sheet already has PROJ_PTS, blend toward it in evaluation() using weight_proj
+    return pts
+
+def _baseline_index(pos: str, teams: int, starters: Dict[str,int]) -> int:
+    return max(1, teams * int(starters.get(pos, 0)))
+
+def _compute_vbd(df: pd.DataFrame, teams: int, starters: Dict[str,int]) -> pd.Series:
+    vbd = pd.Series([0.0]*len(df), index=df.index, dtype=float)
+    for pos in ("QB","RB","WR","TE","K","DST"):
+        sub = df[df["POS"] == pos].sort_values("value_raw", ascending=False)
+        if sub.empty:
+            continue
+        idx = _baseline_index(pos, teams, starters)  # e.g., RB baseline = teams*2
+        idx = min(idx, len(sub))
+        baseline_val = float(sub.iloc[idx-1]["value_raw"])
+        vbd.loc[sub.index] = sub["value_raw"] - baseline_val
+    return vbd
+
+def evaluate_players(
+    df_in: pd.DataFrame,
+    config: Dict[str, Any],
+    teams: int,
+    rounds: int,
+    weight_proj: float = 0.65
+) -> pd.DataFrame:
     """
-    Returns dataframe with added columns: base_points, value, vbd, notes
-    Supports POS in {QB,RB,WR,TE,K,DST}
+    Return df with computed columns:
+      - value_raw: projection from components (or PROJ_PTS)
+      - value: blended (weight_proj * calc_from_components + (1-weight)*PROJ_PTS) then modifiers
+      - vbd: value - baseline per position
+      - tags: lightweight list for downstream reasons
     """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["PLAYER", "POS", "TEAM", "value", "vbd", "notes"])
+    if df_in is None or df_in.empty:
+        return df_in
 
-    teams = int(config.get("draft", {}).get("teams", 12))
-    # Baselines (startable pool size): tweak as needed
-    baselines = {"QB": teams, "RB": teams * 2, "WR": teams * 3, "TE": teams, "K": teams, "DST": teams}
+    df = df_in.copy()
 
-    schedule = _load_schedule_stars()
-    coach = _load_coaching_mods()
+    scoring_cfg = dict(DEFAULT_SCORING)
+    scoring_cfg["ppr"] = float(config.get("scoring", {}).get("ppr", scoring_cfg["ppr"]))
 
-    out = df.copy()
+    # raw projection from components
+    df["calc_proj"] = df.apply(lambda r: _proj_points_row(r, scoring_cfg), axis=1)
+    df["proj_pts"] = df["PROJ_PTS"] if "PROJ_PTS" in df.columns else 0.0
+    df["value_raw"] = df["calc_proj"]  # before modifiers
 
-    # Base points proxy from rank: rank 1 = 100 pts, rank 100 = 0 pts (clipped)
-    if "RK" in out.columns:
-        out["base_points"] = out["RK"].apply(lambda r: max(0.0, 100.0 - float(r)))
+    # Blend with provided PROJ_PTS if present
+    if "PROJ_PTS" in df.columns:
+        df["value_blend"] = weight_proj * df["calc_proj"] + (1.0 - weight_proj) * df["PROJ_PTS"]
     else:
-        out["base_points"] = 50.0
+        df["value_blend"] = df["calc_proj"]
 
-    # Baseline at each position (value at replacement)
-    baseline_points = {}
-    for pos, count in baselines.items():
-        pos_df = out[out["POS"] == pos].sort_values("base_points", ascending=False)
-        baseline_points[pos] = float(pos_df.iloc[count - 1]["base_points"]) if len(pos_df) >= count else 0.0
+    # Apply schedule, injury, small coach/OC nudge
+    sos_mult = df.get("SOS SEASON")
+    df["sos_mult"] = sos_mult.map(lambda s: SOS_MULT.get(int(s), 1.0) if pd.notna(s) else 1.0) if sos_mult is not None else 1.0
 
-    values, vbds, notes = [], [], []
-    for _, row in out.iterrows():
-        pos = row.get("POS", "")
-        team = row.get("TEAM", "")
-        base = float(row.get("base_points", 0.0))
+    def _inj_pen(v):
+        s = str(v or "").strip().lower()
+        return INJURY_PEN.get(s, 0.0)
+    df["inj_mult"] = df.get("INJURY_RISK", pd.Series([""]*len(df))).map(_inj_pen).fillna(0.0)
 
-        # Schedule adjustment (1–5 stars, 3 neutral)
-        stars = schedule.get(team)
-        sched_mult = 1.0
-        note = ""
-        if stars is not None:
-            diff = float(stars) - 3.0
-            sched_mult += diff * 0.05
-            if diff > 0:
-                note += f"Favorable schedule (+{int(diff*5)}%), "
-            elif diff < 0:
-                note += f"Tough schedule ({int(diff*5)}%), "
+    # small coach/OC heuristic: if OC present, tiny +1% (data-informed confidence)
+    df["coach_mult"] = 0.01 * ((~df.get("OC", pd.Series([None]*len(df))).isna()).astype(float))
 
-        # Coaching tendencies (small)
-        cmod = coach.get(team, {})
-        coach_mult = 1.0
-        if pos == "RB":
-            coach_mult *= float(cmod.get("rush_rate", 1.0))
-        if pos in ("QB", "WR", "TE"):
-            coach_mult *= float(cmod.get("pass_rate", 1.0))
-        coach_mult *= float(cmod.get("pace", 1.0))
+    # Final value before VBD
+    df["value"] = df["value_blend"] * df["sos_mult"] * (1.0 + df["coach_mult"]) * (1.0 + df["inj_mult"])
 
-        total = base * sched_mult * coach_mult
-        baseline = baseline_points.get(pos, 0.0)
-        vbd = total - baseline
+    # Compute VBD (per position baseline)
+    starters_cfg = dict(DEFAULT_STARTERS)
+    starters_cfg.update(config.get("starters", {}))  # allow overrides in config if present
+    df["vbd"] = _compute_vbd(df, teams=teams, starters=starters_cfg)
 
-        if str(row.get("TIERS", "")).strip():
-            note += f"Tier {row.get('TIERS')}, "
-        if str(row.get("BYE", "")).strip() and pos != "DST":
-            note += f"Bye wk {row.get('BYE')}, "
+    # Clean columns for downstream
+    for col in ["calc_proj","value_blend","sos_mult","inj_mult","coach_mult"]:
+        df[col] = df[col].astype(float)
 
-        values.append(total)
-        vbds.append(vbd)
-        notes.append(note.rstrip(", "))
-
-    out["value"] = values
-    out["vbd"] = vbds
-    out["notes"] = notes
-
-    out = out.sort_values(["value", "vbd"], ascending=[False, False]).reset_index(drop=True)
-    return out
+    return df
