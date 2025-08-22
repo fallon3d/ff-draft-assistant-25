@@ -45,17 +45,27 @@ def _proj_points_row(row: pd.Series, scoring: Dict[str, float]) -> float:
     return pts
 
 def _baseline_index(pos: str, teams: int, starters: Dict[str,int]) -> int:
+    # Baseline = last starter at the position (e.g., RB24 in 12-team 2-RB starters)
     return max(1, teams * int(starters.get(pos, 0)))
 
 def _compute_vbd(df: pd.DataFrame, teams: int, starters: Dict[str,int]) -> pd.Series:
-    vbd = pd.Series([0.0]*len(df), index=df.index, dtype=float)
+    """
+    Compute VBD against the baseline *after* all value modifiers.
+    """
+    vbd = pd.Series(0.0, index=df.index, dtype=float)
+    # Ensure the 'value' column exists
+    vals = df["value"] if "value" in df.columns else df.get("value_blend", pd.Series(0.0, index=df.index))
+    tmp = df.assign(_val=vals)
+
     for pos in ("QB","RB","WR","TE","K","DST"):
-        sub = df[df["POS"] == pos].sort_values("value_raw", ascending=False)
-        if sub.empty: continue
+        sub = tmp[tmp["POS"] == pos].sort_values("_val", ascending=False)
+        if sub.empty:
+            continue
         idx = min(_baseline_index(pos, teams, starters), len(sub))
-        baseline = float(sub.iloc[idx-1]["value_raw"])
-        vbd.loc=sub.index
-        vbd.loc[sub.index] = sub["value_raw"] - baseline
+        baseline = float(sub.iloc[idx-1]["_val"])
+        # <- this was the bug; keep only the bracketed assignment:
+        vbd.loc[sub.index] = sub["_val"] - baseline
+
     return vbd
 
 def evaluate_players(
@@ -71,6 +81,7 @@ def evaluate_players(
     scoring_cfg = dict(DEFAULT_SCORING)
     scoring_cfg["ppr"] = float(config.get("scoring", {}).get("ppr", scoring_cfg["ppr"]))
 
+    # Base projections and blended value (if PROJ_PTS provided)
     df["calc_proj"] = df.apply(lambda r: _proj_points_row(r, scoring_cfg), axis=1)
     df["proj_pts"] = df["PROJ_PTS"] if "PROJ_PTS" in df.columns else 0.0
     df["value_raw"] = df["calc_proj"]
@@ -97,6 +108,7 @@ def evaluate_players(
     # Final value before VBD
     df["value"] = df["value_blend"] * df["sos_mult"] * (1.0 + df["coach_mult"]) * (1.0 + df["inj_mult"])
 
+    # Starters config + VBD
     starters_cfg = dict(DEFAULT_STARTERS)
     starters_cfg.update(config.get("starters", {}))
     df["vbd"] = _compute_vbd(df, teams=teams, starters=starters_cfg)
