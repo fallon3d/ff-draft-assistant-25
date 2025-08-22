@@ -1,1 +1,1 @@
-"""Core module for Fantasy Football Draft Assistant."""
+# Intentionally empty: marks 'core' as a package.
