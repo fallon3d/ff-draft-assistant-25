@@ -15,6 +15,7 @@ HTTP_TIMEOUT = 10.0
 _CACHE: Dict[str, tuple[float, Any]] = {}
 TTL_SECONDS = 30.0
 
+
 def _get(path: str) -> Any:
     now = time.time()
     if path in _CACHE and now - _CACHE[path][0] < TTL_SECONDS:
@@ -29,23 +30,29 @@ def _get(path: str) -> Any:
     except Exception:
         return None
 
+
 def get_league_info(league_id: str) -> Optional[dict]:
     return _get(f"/league/{league_id}")
+
 
 def get_drafts_for_league(league_id: str) -> Optional[List[dict]]:
     return _get(f"/league/{league_id}/drafts") or []
 
+
 def get_draft(draft_id: str) -> Optional[dict]:
     return _get(f"/draft/{draft_id}")
+
 
 def get_picks(draft_id: str) -> Optional[List[dict]]:
     return _get(f"/draft/{draft_id}/picks") or []
 
+
 def get_users(league_id: str) -> Optional[List[dict]]:
     return _get(f"/league/{league_id}/users") or []
 
+
 def get_players_nfl() -> Optional[dict]:
-    # Big payload – cache for longer
+    """Large payload of all NFL players (cached for 1 hour)."""
     path = "/players/nfl"
     global TTL_SECONDS
     old_ttl = TTL_SECONDS
@@ -54,16 +61,16 @@ def get_players_nfl() -> Optional[dict]:
     TTL_SECONDS = old_ttl
     return data or {}
 
-# ---- Robust draft_id parsing for mock URLs ----
+
+# ---------------- URL / ID parsing ----------------
 def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
     """
     Accepts:
-      - Raw draft_id (all digits/letters)
+      - Raw draft_id (alnum/underscore, 10–24 chars)
       - URLs like:
         https://sleeper.com/draft/123...
         https://sleeper.com/draft/nfl/123...
         https://sleeper.com/draft/board/123...
-    Strategy: Prefer the longest 10–24 char alnum token at the end or anywhere in path.
     """
     s = str(url_or_id).strip()
     # Raw id?
@@ -75,7 +82,7 @@ def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
     if m:
         return m.group(1)
 
-    # Fallback: longest plausible id-looking token
+    # Fallback: longest plausible token
     candidates = re.findall(r"([A-Za-z0-9_]{10,24})", s)
     if candidates:
         candidates.sort(key=len, reverse=True)
@@ -83,31 +90,33 @@ def parse_draft_id_from_url(url_or_id: str) -> Optional[str]:
 
     return None
 
-# ---- Defensive picks -> internal log conversion ----
+
+# ---------------- Picks conversion ----------------
 def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | None = None) -> List[dict]:
     """
     Convert Sleeper picks to our simple structure:
       {round, pick_no, team, metadata:{first_name,last_name,position}}
-    Tries multiple fields and computes round/pick_no from 'pick' if needed (and teams provided).
+    Tries multiple fields and computes round/pick_no from 'pick' if needed (when teams provided).
     """
     out = []
     for p in picks or []:
         meta = p.get("metadata") or {}
         pid = p.get("player_id")
-        # Name
-        first, last = meta.get("first_name",""), meta.get("last_name","")
+        # Name from metadata, otherwise from players_map
+        first, last = meta.get("first_name", ""), meta.get("last_name", "")
         if (not first and not last) and pid and pid in players_map:
-            pm = players_map[pid]
-            first, last = pm.get("first_name",""), pm.get("last_name","")
+            pm = players_map[pid] or {}
+            first = pm.get("first_name", "") or ""
+            last = pm.get("last_name", "") or ""
             meta["position"] = meta.get("position") or pm.get("position")
         # Position fallback from players_map
         if not meta.get("position") and pid and pid in players_map:
-            meta["position"] = players_map[pid].get("position")
+            meta["position"] = (players_map[pid] or {}).get("position")
 
         # Round / pick_no
         rnd = p.get("round")
         pick_no = p.get("pick_no")
-        overall = p.get("pick")  # Sleeper sometimes provides this
+        overall = p.get("pick")  # some rooms provide 'pick' as overall number
 
         if (rnd is None or pick_no is None) and overall and teams:
             try:
@@ -131,6 +140,53 @@ def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | Non
             "round": rnd,
             "pick_no": pick_no,
             "team": p.get("picked_by") or "",
-            "metadata": {"first_name": first, "last_name": last, "position": meta.get("position")},
+            "metadata": {
+                "first_name": first,
+                "last_name": last,
+                "position": meta.get("position"),
+            },
         })
+    return out
+
+
+# ---------------- NEW: Picked names helper ----------------
+def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
+    """
+    Build a set of drafted player names as strings that match our CSV 'PLAYER' field
+    as closely as possible: 'First Last' when available, falling back to players_map.
+
+    For DST/K edge cases we also try:
+      - metadata.name (if provided)
+      - players_map[pid]['full_name'] or ['last_name'] or ['first_name']
+    """
+    out: set[str] = set()
+    for p in picks or []:
+        meta = p.get("metadata") or {}
+        pid = p.get("player_id")
+
+        first = (meta.get("first_name") or "").strip()
+        last = (meta.get("last_name") or "").strip()
+        full = f"{first} {last}".strip()
+
+        # Fallbacks via players_map
+        if not full and pid and players_map:
+            pm = players_map.get(pid) or {}
+            pf = (pm.get("first_name") or "").strip()
+            pl = (pm.get("last_name") or "").strip()
+            if pf or pl:
+                full = f"{pf} {pl}".strip()
+            else:
+                full = (pm.get("full_name") or pm.get("name") or "").strip()
+
+        # Last resort: metadata 'name'
+        if not full:
+            full = (meta.get("name") or "").strip()
+
+        # Add if we have anything at all
+        if full:
+            out.add(full)
+
+        # Note: some DST names in Sleeper won't exactly match CSV (e.g., "San Francisco 49ers" vs "49ers D/ST").
+        # We intentionally avoid guessing here; the app keeps those rows available unless the CSV uses matching names.
+
     return out
