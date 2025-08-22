@@ -1,9 +1,10 @@
 """
-Suggestion engine (revamped, with strict early-QB deferral):
+Suggestion engine (revamped, with strict early-QB deferral and robust numeric parsing):
 - Strong QB deferral before a configured round (default R8) — QBs won't top the board early.
 - Dynamic strategies incl. Zero WR, Modified Zero RB / Hero RB, Late QB/TE, BPA.
 - Tier scarcity, run detection, handcuff priority, bye conflict, stack leverage (post-deferral).
 - "Likely gone / Might make it" based on intervening picks.
+- SAFE parsing for messy spreadsheet values (ECR VS. ADP, RK, BYE, TIERS, etc.).
 """
 
 import math
@@ -23,6 +24,39 @@ DEFAULT_ELITE_QB_POS_RANK = 3
 DEFAULT_STACK_BONUS = 0.06
 HANDCUFF_LATE_ROUND = 9
 
+# ---------- helpers ----------
+
+def _num(x, default=0.0):
+    """Coerce anything to float safely: handles '—', 'N/A', '+4', '4%', blanks, etc."""
+    if x is None:
+        return float(default)
+    try:
+        if pd.isna(x):
+            return float(default)
+    except Exception:
+        pass
+    s = str(x).strip()
+    if s == "" or s.lower() in {"na", "n/a", "—", "-", "null", "none"}:
+        return float(default)
+    s = s.replace(",", "").replace("%", "")
+    try:
+        return float(s)
+    except Exception:
+        # last resort: extract first signed number
+        import re
+        m = re.search(r"[-+]?(\d+(\.\d+)?)", s)
+        if m:
+            try:
+                return float(m.group(0))
+            except Exception:
+                return float(default)
+        return float(default)
+
+def _int(x, default=0):
+    try:
+        return int(round(_num(x, default)))
+    except Exception:
+        return int(default)
 
 def _pos_counts_from_names(names: List[str], universe: pd.DataFrame) -> dict:
     if not names or universe is None or universe.empty:
@@ -34,7 +68,6 @@ def _pos_counts_from_names(names: List[str], universe: pd.DataFrame) -> dict:
         if p in out: out[p] += 1
     return out
 
-
 def needs_summary(available_df, user_picked_names: List[str], user_pos_counts: Optional[Dict[str,int]]=None) -> str:
     counts = (
         {k:int(user_pos_counts.get(k,0)) for k in ("QB","RB","WR","TE","K","DST")}
@@ -44,21 +77,19 @@ def needs_summary(available_df, user_picked_names: List[str], user_pos_counts: O
     parts = [f"{v} {k}" for k, v in needs.items() if v > 0]
     return f"You still need: {', '.join(parts)}" if parts else "Starters filled — build depth and upside."
 
-
 def _rookie_flag(row: pd.Series) -> bool:
     try:
-        if "ROOKIE" in row.index and int(row["ROOKIE"]) == 1: return True
+        if "ROOKIE" in row.index and _int(row["ROOKIE"]) == 1: 
+            return True
     except Exception:
         pass
     s = str(row.get("TIERS","")).strip().lower()
     return ("rookie" in s) or (s == "r")
 
-
 def _likely_gone_prob(rank: int, intervening_picks: int) -> float:
     if rank <= 0: rank = 999
     x = (intervening_picks - max(0, 25 - rank*0.2)) / 8.0
     return 1.0 / (1.0 + math.exp(-x))
-
 
 def _tier_map(df: pd.DataFrame) -> Dict[str, int]:
     tm = {}
@@ -66,14 +97,15 @@ def _tier_map(df: pd.DataFrame) -> Dict[str, int]:
         pos_df = df[df["POS"] == pos]
         if not pos_df.empty:
             try:
-                min_tier = pos_df["TIERS"].astype(str).replace("", "999").astype(int).min()
+                tiers = pos_df["TIERS"].astype(str).str.strip().replace({"": "999"})
+                tiers = tiers.map(lambda x: str(_int(x, 999)))
+                min_tier = tiers.astype(int).min()
             except Exception:
                 min_tier = 999
             tm[pos] = min_tier
         else:
             tm[pos] = 999
     return tm
-
 
 def detect_run(pick_log: List[dict], recent: int = 6) -> str:
     if not pick_log: return ""
@@ -85,7 +117,6 @@ def detect_run(pick_log: List[dict], recent: int = 6) -> str:
             if pos.count(candidate) >= 4: return candidate
     return ""
 
-
 def _scarcity_bonus(pos: str, remaining_in_top_tier: int) -> float:
     if remaining_in_top_tier <= 1:
         return 0.07
@@ -95,15 +126,16 @@ def _scarcity_bonus(pos: str, remaining_in_top_tier: int) -> float:
         return 0.03
     return 0.0
 
-
 def _pos_rank_map(df: pd.DataFrame) -> Dict[int, int]:
     pos_rank = {}
     for pos in ("QB","RB","WR","TE","K","DST"):
         sub = df[df["POS"] == pos].sort_values("value", ascending=False).reset_index()
         for i, (_, row) in enumerate(sub.iterrows(), start=1):
-            pos_rank[int(row["index"])] = i
+            try:
+                pos_rank[int(row["index"])] = i
+            except Exception:
+                continue
     return pos_rank
-
 
 def _build_stack_state(user_picked_names: List[str], universe_df: pd.DataFrame) -> Dict[str, set]:
     if universe_df is None or universe_df.empty:
@@ -116,6 +148,7 @@ def _build_stack_state(user_picked_names: List[str], universe_df: pd.DataFrame) 
         if t and p in have: have[p].add(t)
     return have
 
+# ---------- main ranking ----------
 
 def rank_suggestions(
     available_df,
@@ -142,6 +175,7 @@ def rank_suggestions(
         return pd.DataFrame(columns=["PLAYER","POS","TEAM","score","why","value","vbd","next_turn_tag"])
 
     df = available_df.copy()
+    # Ensure columns exist
     for c in ["value","vbd","RK","TIERS","BYE","POS","TEAM","PLAYER","ECR VS. ADP","INJURY_RISK","VOLATILITY","HANDCUFF_TO"]:
         if c not in df.columns: df[c] = 0
 
@@ -165,9 +199,12 @@ def rank_suggestions(
     run_pos = detect_run(pick_log)
 
     remain_top_tier = {}
+    # TIERS can be messy; use safe int mapping:
+    temp_tiers = df["TIERS"].astype(str).str.strip().replace({"": "999"})
+    tiers_int = temp_tiers.map(lambda x: _int(x, 999))
     for pos in ("QB","RB","WR","TE","K","DST"):
-        top_tier = tm.get(pos, 999)
-        remain_top_tier[pos] = int(df[(df["POS"]==pos) & (df["TIERS"].astype(str).replace("", "999").astype(int)==top_tier)].shape[0]) if "TIERS" in df.columns else 0
+        mask = (df["POS"] == pos) & (tiers_int == (tiers_int[df["POS"] == pos].min() if (tiers_int[df["POS"] == pos]).size else 999))
+        remain_top_tier[pos] = int(df[mask].shape[0]) if df.shape[0] else 0
 
     if current_overall and user_slot:
         intervening = utils.picks_until_next_turn(current_overall, int(teams), int(user_slot))
@@ -182,12 +219,12 @@ def rank_suggestions(
 
     rows = []
     for idx, row in df.iterrows():
-        pos = row["POS"]
-        base = float(row.get("value", 0.0))
-        vbd = float(row.get("vbd", 0.0))
-        rk = int(row.get("RK", 999)) if pd.notna(row.get("RK")) else 999
-        bye = int(row.get("BYE", 0)) if pd.notna(row.get("BYE")) else 0
-        ecr_delta = float(row.get("ECR VS. ADP", 0.0)) if pd.notna(row.get("ECR VS. ADP")) else 0.0
+        pos = str(row.get("POS","")).upper().strip()
+        base = float(_num(row.get("value"), 0.0))
+        vbd = float(_num(row.get("vbd"), 0.0))
+        rk = _int(row.get("RK"), 999)
+        bye = _int(row.get("BYE"), 0)
+        ecr_delta = float(_num(row.get("ECR VS. ADP"), 0.0))
         inj = str(row.get("INJURY_RISK","")).strip().lower()
         vol = str(row.get("VOLATILITY","")).strip().lower()
         team = str(row.get("TEAM","")).strip().upper()
@@ -234,34 +271,32 @@ def rank_suggestions(
             why_bits.append(f"punting {pos} for now")
 
         # -------- STRICT EARLY-QB DEFERRAL (hard gate) --------
-        # If we haven't drafted a QB and we're before the hard gate round, crush QB scores.
         if pos == "QB" and counts.get("QB",0) == 0 and round_number < qb_forbid_before:
-            score *= 0.35  # strong downweight so QB won't top early lists
+            score *= 0.35
             why_bits.append(f"QB deferred until R{qb_forbid_before}")
 
-        # --- Soft early timing for QB/TE (still applies after the hard gate window) ---
+        # --- Soft early timing for QB/TE (after hard gate window) ---
         pr = int(pos_rank.get(int(idx), 99))
         if pos == "QB" and counts.get("QB",0) == 0 and round_number < early_qb_round_soft:
-            # If hard gate still active, the penalty above already hit; keep stack/elite bonuses off during hard gate.
             if round_number >= qb_forbid_before:
-                elite_qb_window = (pr <= elite_qb_pos_rank)
+                elite_qb_window = (pr <= DEFAULT_ELITE_QB_POS_RANK)
                 stack_here = (team in have_stack.get("WR",set()) or team in have_stack.get("TE",set()))
                 if not (elite_qb_window or stack_here):
                     score *= 0.82
                     why_bits.append(f"wait on QB (rank {pr})")
                 elif stack_here:
-                    score *= (1.0 + stack_bonus)
+                    score *= (1.0 + DEFAULT_STACK_BONUS)
                     why_bits.append("QB stack leverage")
 
-        if pos == "TE" and counts.get("TE",0) == 0 and round_number < early_te_round:
+        if pos == "TE" and counts.get("TE",0) == 0 and round_number < DEFAULT_EARLY_TE_ROUND:
             elite_te_window = (pr <= 2)
             if not elite_te_window:
                 score *= 0.88
                 why_bits.append(f"wait on TE (rank {pr})")
 
-        # Stacking bonus for WR/TE with your QB (always allowed)
+        # Stacking bonus for WR/TE with your QB
         if pos in ("WR","TE") and team in have_stack.get("QB", set()):
-            score *= (1.0 + stack_bonus)
+            score *= (1.0 + DEFAULT_STACK_BONUS)
             why_bits.append(f"stack with your QB ({team})")
 
         # Handcuff priority (late rounds)
@@ -280,17 +315,17 @@ def rank_suggestions(
             score *= 1.05
             why_bits.append("late rookie ceiling")
 
-        if round_number >= max(8, int(total_rounds * (2/3.0))) and str(row.get("VOLATILITY","")).strip().lower() in ("medium","high"):
-            score *= (1.0 + (w_vol if str(row.get("VOLATILITY","")).strip().lower() == "high" else w_vol/2.0))
+        if round_number >= max(8, int(total_rounds * (2/3.0))) and vol in ("medium","high"):
+            score *= (1.0 + (w_vol if vol == "high" else w_vol/2.0))
             why_bits.append("late-round volatility upside")
 
         # Availability to next turn
-        gone_p = _likely_gone_prob(int(row.get("RK", 999)) if pd.notna(row.get("RK")) else 999, intervening)
+        gone_p = _likely_gone_prob(rk if rk > 0 else 999, intervening)
         score *= (1.0 + 0.10 * gone_p)
         next_turn_tag = "🔥 likely gone" if gone_p >= 0.65 else ("⏳ might make it" if gone_p <= 0.35 else "")
 
         # Bye conflict (light)
-        if bye and bye in user_bye_weeks and pos in ("RB","WR","TE","QB"):
+        if bye and (bye in (user_bye_weeks or set())) and pos in ("RB","WR","TE","QB"):
             score *= 0.98
             why_bits.append(f"bye conflict (wk {bye})")
 
@@ -385,7 +420,6 @@ def choose_strategy(
     def _sanitize(choices: List[str], round_num: int) -> List[str]:
         if not have_qb and round_num < qb_forbid_before and "QB" in choices:
             out = [c for c in choices if c != "QB"]
-            # sensible fallback if all were QB
             return out or ["WR","RB","TE"]
         return choices
 
