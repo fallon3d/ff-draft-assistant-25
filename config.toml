@@ -1,15 +1,28 @@
 [sleeper]
-league_id = "123456789012345678"
+league_id = ""
+poll_seconds = 5
 
 [draft]
 rounds = 15
 teams = 12
 
+[starters]
+QB = 1
+RB = 2
+WR = 3
+TE = 1
+K = 1
+DST = 1
+
 [scoring]
 ppr = 1.0
-pass_yd = 0.04
-rush_yd = 0.1
-rec_yd = 0.1
-pass_td = 4.0
-rush_td = 6.0
-rec_td = 6.0
+
+[user_profile]
+sleeper_username = "Fallon3D"
+user_slot = 0
+
+[strategy]
+default_strategy = "Hero RB + WR Flood (optional early TE)"
+elite_te_value = 78.0
+hero_rb_value = 85.0
+kd_only_last_round = true
