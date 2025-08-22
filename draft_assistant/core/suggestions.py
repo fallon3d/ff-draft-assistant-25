@@ -1,9 +1,9 @@
 """
 Unified suggestion engine (Live + Mock) with:
-- K/DST timing logic
-- "Might make it" highlight based on picks-until-next-turn
-- Late-round rookie boost
-- Strategy picker at first pick across 3 strategies you provided
+- Tunable Elite TE / Hero RB thresholds (for Round-1 strategy)
+- K/DST timing switch: only last round (or last 1–2)
+- "Might make it" highlight
+- Positional needs summary helper
 """
 from __future__ import annotations
 import math
@@ -27,13 +27,19 @@ def _pos_counts_from_names(names: list[str], universe: pd.DataFrame) -> dict:
             out[p] += 1
     return out
 
+def needs_summary(available_df: pd.DataFrame, user_picked_names: List[str]) -> str:
+    """Return a human-readable needs string like 'You still need: 1 TE, 2 RB'."""
+    counts = _pos_counts_from_names(user_picked_names, available_df if available_df is not None else pd.DataFrame(columns=["PLAYER","POS"]))
+    needs = {pos: max(0, STARTERS.get(pos, 0) - counts.get(pos, 0)) for pos in STARTERS}
+    parts = [f"{v} {k}" for k, v in needs.items() if v > 0]
+    return f"You still need: {', '.join(parts)}" if parts else "Starters filled — build depth and upside."
+
 def _rookie_flag(row: pd.Series) -> bool:
-    if "ROOKIE" in row.index:
-        try:
-            if int(row["ROOKIE"]) == 1:
-                return True
-        except Exception:
-            pass
+    try:
+        if "ROOKIE" in row.index and int(row["ROOKIE"]) == 1:
+            return True
+    except Exception:
+        pass
     s = str(row.get("TIERS","")).strip().lower()
     return ("rookie" in s) or (s == "r")
 
@@ -87,12 +93,12 @@ def rank_suggestions(
     username: str,
     current_overall: int | None = None,
     user_slot: int | None = None,
+    kd_only_last_round: bool = True,
 ) -> pd.DataFrame:
     if available_df is None or available_df.empty:
         return pd.DataFrame(columns=["PLAYER","POS","TEAM","score","why","value","vbd","next_turn_tag"])
 
     df = available_df.copy()
-    # Ensure evaluation columns exist
     for c in ["value","vbd","RK","TIERS","BYE","POS","TEAM","PLAYER"]:
         if c not in df.columns:
             df[c] = 0
@@ -101,14 +107,14 @@ def rank_suggestions(
     tm = _tier_map(df)
     run_pos = detect_run(pick_log)
 
-    # Intervening picks to your next turn (use precise math if available)
+    # Intervening picks to your next turn (precise if we know slot)
     if current_overall and user_slot:
         intervening = utils.picks_until_next_turn(current_overall, int(teams), int(user_slot))
     else:
         intervening = max(0, teams - 1)
 
     last_third = round_number >= max(8, int(total_rounds * (2/3.0)))
-    late_k_dst_round = max(total_rounds - 2, total_rounds - 1)  # last 1-2 rounds
+    late_k_dst_round = total_rounds if kd_only_last_round else max(total_rounds - 1, total_rounds - 2)
 
     scored = []
     for _, row in df.iterrows():
@@ -118,7 +124,7 @@ def rank_suggestions(
         rank_overall = int(row.get("RK", 999))
         why_bits = []
 
-        # Start with base + VBD
+        # Base + VBD
         score = base + 0.35 * vbd
         why_bits.append(f"value {base:.1f} / VBD {vbd:.1f}")
 
@@ -142,12 +148,12 @@ def rank_suggestions(
         if sc_bump > 0:
             why_bits.append("tier/pos scarcity")
 
-        # Position run
+        # Position run bump
         if run_pos and pos == run_pos:
             score *= 1.05
             why_bits.append(f"{pos} run")
 
-        # K/DST timing: strongly delay until very late unless insane value
+        # K/DST timing
         if pos in ("K","DST"):
             if round_number < late_k_dst_round:
                 score *= 0.65
@@ -156,7 +162,7 @@ def rank_suggestions(
                 score *= 1.10
                 why_bits.append("late-round K/DST timing")
 
-        # Likely-gone probability before your next pick
+        # Likely-gone before next pick
         gone_p = _likely_gone_prob(rank_overall, intervening)
         score *= (1.0 + 0.10 * gone_p)
         next_turn_tag = "🔥 likely gone" if gone_p >= 0.65 else ("⏳ might make it" if gone_p <= 0.35 else "")
@@ -186,7 +192,7 @@ def rank_suggestions(
 STRATS = {
     "Anchor WR + Early Elite TE": {
         "name": "Anchor WR + Early Elite TE (default)",
-        "plan": [["WR"], ["TE","WR"], ["WR"]],  # rough first 3 picks emphasis
+        "plan": [["WR"], ["TE","WR"], ["WR"]],
         "why": "Bank elite PPR volume at WR and lock an edge at TE early.",
     },
     "Modified Zero RB": {
@@ -202,19 +208,17 @@ STRATS = {
 }
 
 def _simulate_board(df: pd.DataFrame, picks_to_remove: int) -> pd.DataFrame:
-    """
-    Remove the top N overall values to approximate intervening selections.
-    """
     if picks_to_remove <= 0 or df.empty:
         return df
     pruned = df.sort_values("value", ascending=False).iloc[picks_to_remove:].reset_index(drop=True)
     return pruned
 
 def _best_for_positions(df: pd.DataFrame, pos_choices: List[str]) -> float:
-    """
-    Given a list of acceptable positions (e.g., ["TE","WR"]), return the best single player's value.
-    """
     sub = df[df["POS"].isin(pos_choices)].sort_values("value", ascending=False)
+    return float(sub.iloc[0]["value"]) if not sub.empty else 0.0
+
+def _top_value_at_pos(df: pd.DataFrame, pos: str) -> float:
+    sub = df[df["POS"] == pos].sort_values("value", ascending=False)
     return float(sub.iloc[0]["value"]) if not sub.empty else 0.0
 
 def choose_strategy(
@@ -223,47 +227,77 @@ def choose_strategy(
     user_slot: int,
     teams: int,
     total_rounds: int,
+    elite_te_value: float = 78.0,
+    hero_rb_value: float = 85.0,
 ) -> Dict[str, Any]:
     """
-    Pick the best starting path based on who is available and who likely remains by your next turns.
-    Simple lookahead: simulate top-N picks disappearing before each of your next two turns.
+    Pick the best starting path based on who is available and likely to remain.
+    Uses tunable thresholds for 'Elite TE' and 'Hero RB' detection.
     """
     if available_df is None or available_df.empty:
         return {"name":"Anchor WR + Early Elite TE (default)","why":"Empty board fallback."}
 
     df = available_df.copy()
-    # Ensure 'value' exists
     if "value" not in df.columns:
         df["value"] = 50.0
+
     # Intervening picks to next and next-next turns
     picks_to_next = utils.picks_until_next_turn(current_overall, teams, user_slot)
-    # After taking one at current_overall, your NEXT next turn will be:
-    next_overall_1 = current_overall  # assume you are about to pick now
+    next_overall_1 = current_overall  # on the clock now
     next_overall_2 = utils.next_pick_overall(next_overall_1 + 1 + picks_to_next, teams, user_slot)
     picks_between_second = max(0, next_overall_2 - (next_overall_1 + 1 + picks_to_next))
 
-    # Evaluate each strat by summing expected values at targeted positions
+    # Detect availability of elite TE / hero RB now and after picks
+    top_te_now = _top_value_at_pos(df, "TE")
+    board_after_next = _simulate_board(df, picks_to_next)
+    top_te_after = _top_value_at_pos(board_after_next, "TE")
+    elite_te_now = top_te_now >= elite_te_value
+    elite_te_wont_last = elite_te_now and (top_te_after < elite_te_value)
+
+    top_rb_now = _top_value_at_pos(df, "RB")
+    hero_rb_now = top_rb_now >= hero_rb_value
+
     scores = []
     for key, meta in STRATS.items():
+        plan = [p[:] for p in meta["plan"]]  # copy
+        why_extra = []
+
+        # If Anchor WR + Early TE, only push TE pick-2 if elite TE now or likely gone
+        if key == "Anchor WR + Early Elite TE" and not (elite_te_now or elite_te_wont_last):
+            # de-emphasize TE early if not elite by threshold
+            plan[1] = ["WR"]
+
+        # If Hero RB strat but no hero RB on board, soften it by allowing WR first
+        if key == "Hero RB + WR Flood" and not hero_rb_now:
+            plan[0] = ["WR"]
+
         v_total = 0.0
         board_now = df.sort_values("value", ascending=False).reset_index(drop=True)
+
         # Pick 1
-        v_total += _best_for_positions(board_now, meta["plan"][0])
-        board_after1 = board_now.drop(board_now[board_now["POS"].isin(meta["plan"][0])].head(1).index).reset_index(drop=True)
+        v_total += _best_for_positions(board_now, plan[0])
+        board_after1 = board_now.drop(board_now[board_now["POS"].isin(plan[0])].head(1).index).reset_index(drop=True)
         # Simulate others until your next turn
         board_at_turn2 = _simulate_board(board_after1, picks_to_next)
         # Pick 2
-        v_total += _best_for_positions(board_at_turn2, meta["plan"][1])
-        board_after2 = board_at_turn2.drop(board_at_turn2[board_at_turn2["POS"].isin(meta["plan"][1])].head(1).index).reset_index(drop=True)
+        v_total += _best_for_positions(board_at_turn2, plan[1])
+        board_after2 = board_at_turn2.drop(board_at_turn2[board_at_turn2["POS"].isin(plan[1])].head(1).index).reset_index(drop=True)
         # Simulate others until your third pick
         board_at_turn3 = _simulate_board(board_after2, picks_between_second)
-        # Pick 3
-        want3 = meta["plan"][2] if len(meta["plan"]) > 2 else ["WR","RB","TE"]
+        # Pick 3 (fallback WR/RB/TE)
+        want3 = plan[2] if len(plan) > 2 else ["WR","RB","TE"]
         v_total += _best_for_positions(board_at_turn3, want3)
 
-        scores.append((key, v_total, meta["why"]))
+        if elite_te_now: why_extra.append("elite TE available")
+        if elite_te_wont_last: why_extra.append("elite TE unlikely to last")
+        if hero_rb_now: why_extra.append("hero RB available")
 
-    # Choose best
+        why = meta["why"]
+        if why_extra:
+            why += " (" + ", ".join(why_extra) + ")"
+
+        scores.append((key, v_total, why))
+
     scores.sort(key=lambda x: x[1], reverse=True)
     best_key, best_score, best_why = scores[0]
     return {"name": STRATS[best_key]["name"], "why": best_why, "score": best_score}
