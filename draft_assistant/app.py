@@ -16,9 +16,12 @@ import streamlit as st
 from core import utils, sleeper, roster, evaluation, suggestions, mock_ai, pdf_report
 
 st.set_page_config(page_title="Fantasy Football Draft Assistant", layout="wide")
+
+# ---------- Data paths ----------
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# ---------- Config ----------
 config = utils.read_config()
 league_info = None
 
@@ -123,7 +126,7 @@ def _save_master(upload):
     content = upload.read()
     with open(MASTER_PATH, "wb") as f:
         f.write(content)
-    df = utils.read_player_table(MASTER_PATH)  # handles csv/xlsx
+    df = utils.read_player_table(MASTER_PATH)  # handles csv/xlsx + normalization
     df.to_csv(CSV_MIRROR, index=False)
     st.sidebar.success("Players file saved and normalized.")
 
@@ -204,6 +207,7 @@ with tab_live:
     if c2.button("Refresh now"):
         st.rerun()
     if auto:
+        # Streamlit-safe meta refresh
         st.markdown(f"<meta http-equiv='refresh' content='{int(poll_seconds)}'>", unsafe_allow_html=True)
         st.caption(f"Auto-refresh every {int(poll_seconds)}s.")
 
@@ -301,7 +305,13 @@ with tab_live:
 # ===================== MOCK =====================
 with tab_mock:
     st.subheader("Mock Draft (Practice Mode)")
-    mock_url = st.text_input("Sleeper Mock Draft URL", value="", key="mock_sleeper_url")
+
+    # Accept either a full Sleeper URL or just the draft_id
+    mock_url = st.text_input(
+        "Sleeper Mock URL or draft_id",
+        value="",
+        help="Paste a URL like https://sleeper.com/draft/nfl/123... or just the 123... id."
+    )
     c1, c2, c3 = st.columns([1,1,1])
     load_btn = c1.button("Load / Re-sync Mock")
     clear_btn = c2.button("Reset Practice")
@@ -316,22 +326,31 @@ with tab_mock:
     if load_btn and mock_url.strip():
         draft_id = sleeper.parse_draft_id_from_url(mock_url.strip())
         if not draft_id:
-            st.error("Could not parse draft_id from URL.")
+            st.error("Could not parse a draft_id from your input. Paste a full Sleeper URL or the id itself.")
         else:
             picks = sleeper.get_picks(draft_id) or []
             dmeta = sleeper.get_draft(draft_id) or {}
             teams_from_api = int(dmeta.get("settings", {}).get("teams", config.get("draft", {}).get("teams", 12)) or dmeta.get("teams", 12))
             rounds_from_api = int(dmeta.get("settings", {}).get("rounds", config.get("draft", {}).get("rounds", 15)))
+
             users = dmeta.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams_from_api+1)]
 
-            # Build availability
+            # Build availability by removing picked names
             players_map = sleeper.get_players_nfl() or {}
             picked_names = sleeper.picked_player_names(picks, players_map)
             available = utils.remove_players_by_name(full_pool.copy(), picked_names)
-            evaluated = evaluation.evaluate_players(available, config, teams=teams_from_api, rounds=rounds_from_api, weight_proj=float(w_proj))
 
+            # Evaluate pool
+            evaluated = evaluation.evaluate_players(
+                available, config, teams=teams_from_api, rounds=rounds_from_api, weight_proj=float(w_proj)
+            )
+
+            # Your slot detection (fallback to 1 if unknown)
             detected_slot = utils.user_roster_id(users, sleeper_username)
             my_slot = int(user_slot_override) if int(user_slot_override) > 0 else (detected_slot or 1)
+
+            # Robust picks conversion (use teams to infer round/pick_no if needed)
+            pick_log = sleeper.picks_to_internal_log(picks, players_map, teams_from_api)
 
             st.session_state.mock_state = {
                 "draft_id": draft_id,
@@ -339,12 +358,15 @@ with tab_mock:
                 "rounds": rounds_from_api,
                 "users": users,
                 "your_roster_id": int(my_slot),
-                "pick_log": sleeper.picks_to_internal_log(picks, players_map),
+                "pick_log": pick_log,
                 "available": evaluated.reset_index(drop=True),
                 "current_pick": len(picks) + 1,
                 "full_pool": full_pool.copy(),
             }
-            st.success(f"Mock {draft_id} loaded. Synced {len(picks)} picks.")
+
+            st.success(f"Mock {draft_id} loaded — {len(picks)} picks synced, teams={teams_from_api}, rounds={rounds_from_api}.")
+            if len(picks) == 0:
+                st.warning("No picks found yet. If the mock room just opened, make/observe a pick and click 'Load / Re-sync Mock' again.")
 
     if "mock_state" in st.session_state:
         S = st.session_state.mock_state
