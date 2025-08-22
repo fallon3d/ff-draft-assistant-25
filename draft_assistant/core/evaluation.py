@@ -1,96 +1,106 @@
 """
-Player evaluation and Value-Based Drafting (VBD) calculations.
+Player evaluation with simple VBD-like scoring + schedule/coaching modifiers.
+Now includes K and DST baselines.
 """
-def evaluate_players(df, config, user_team=None):
-    """
-    Evaluate players with custom scoring, VBD, schedule, and coaching modifiers.
-    Returns DataFrame with additional columns: value, vbd, notes.
-    """
-    import pandas as pd
-    
-    teams = config.get("draft", {}).get("teams", 12)
-    # Assume starters: 1 QB, 2 RB, 3 WR, 1 TE per team by default
-    baselines = {
-        "QB": teams,
-        "RB": teams * 2,
-        "WR": teams * 3,
-        "TE": teams
-    }
-    # Load schedule and coaching modifiers if available
-    try:
-        schedule_df = pd.read_csv("data/sample_schedule.csv")
-        sched_dict = dict(zip(schedule_df["TEAM"], schedule_df["STARS"]))
-    except Exception:
-        sched_dict = {}
-    import json
-    try:
-        with open("data/coaching_modifiers.json") as f:
-            coach_mod = json.load(f)
-    except Exception:
-        coach_mod = {}
+import json
+import os
+import pandas as pd
 
-    df = df.copy()
-    # Base value: inverse of RK (assuming lower RK is better, e.g., 1 is top)
-    if "RK" in df.columns:
-        df["base_points"] = df["RK"].apply(lambda x: max(0, 100 - float(x)))
+def _load_schedule_stars() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "..", "data", "sample_schedule.csv")
+    if not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_csv(path)
+        col_stars = "STARS" if "STARS" in df.columns else ("SOS" if "SOS" in df.columns else None)
+        if col_stars is None:
+            return {}
+        return dict(zip(df["TEAM"], df[col_stars]))
+    except Exception:
+        return {}
+
+def _load_coaching_mods() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "..", "data", "coaching_modifiers.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def evaluate_players(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """
+    Returns dataframe with added columns: base_points, value, vbd, notes
+    Supports POS in {QB,RB,WR,TE,K,DST}
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["PLAYER", "POS", "TEAM", "value", "vbd", "notes"])
+
+    teams = int(config.get("draft", {}).get("teams", 12))
+    # Baselines (startable pool size): tweak as needed
+    baselines = {"QB": teams, "RB": teams * 2, "WR": teams * 3, "TE": teams, "K": teams, "DST": teams}
+
+    schedule = _load_schedule_stars()
+    coach = _load_coaching_mods()
+
+    out = df.copy()
+
+    # Base points proxy from rank: rank 1 = 100 pts, rank 100 = 0 pts (clipped)
+    if "RK" in out.columns:
+        out["base_points"] = out["RK"].apply(lambda r: max(0.0, 100.0 - float(r)))
     else:
-        # fallback to index or ECR
-        df["base_points"] = 50
-    
-    # Compute baseline points by position
+        out["base_points"] = 50.0
+
+    # Baseline at each position (value at replacement)
     baseline_points = {}
     for pos, count in baselines.items():
-        subset = df[df["POS"] == pos].sort_values("base_points", ascending=False)
-        if len(subset) >= count:
-            baseline_points[pos] = float(subset.iloc[count-1]["base_points"])
-        else:
-            baseline_points[pos] = 0.0
-    
-    values = []
-    vbds = []
-    notes_list = []
-    for idx, player in df.iterrows():
-        pos = player.get("POS")
-        team = player.get("TEAM")
-        base = player.get("base_points", 0)
-        # Schedule adjustment
-        stars = sched_dict.get(team, None)
-        sched_multiplier = 1.0
+        pos_df = out[out["POS"] == pos].sort_values("base_points", ascending=False)
+        baseline_points[pos] = float(pos_df.iloc[count - 1]["base_points"]) if len(pos_df) >= count else 0.0
+
+    values, vbds, notes = [], [], []
+    for _, row in out.iterrows():
+        pos = row.get("POS", "")
+        team = row.get("TEAM", "")
+        base = float(row.get("base_points", 0.0))
+
+        # Schedule adjustment (1–5 stars, 3 neutral)
+        stars = schedule.get(team)
+        sched_mult = 1.0
         note = ""
-        if stars:
-            # Assume stars 1-5, 3 is neutral
-            diff = stars - 3
-            sched_multiplier += diff * 0.05  # 5% per star away from 3
+        if stars is not None:
+            diff = float(stars) - 3.0
+            sched_mult += diff * 0.05
             if diff > 0:
-                note += f"Favorable schedule (+{diff*5:.0f}%), "
+                note += f"Favorable schedule (+{int(diff*5)}%), "
             elif diff < 0:
-                note += f"Tough schedule ({diff*5:.0f}%), "
-        # Coaching adjustment
-        coach = coach_mod.get(team, {})
-        coach_multiplier = 1.0
-        if coach:
-            if pos == "RB":
-                coach_multiplier *= coach.get("rush_rate", 1.0)
-            if pos in ["WR", "QB", "TE"]:
-                coach_multiplier *= coach.get("pass_rate", 1.0)
-            coach_multiplier *= coach.get("pace", 1.0)
-        total_points = base * sched_multiplier * coach_multiplier
-        # Calculate VBD
-        baseline = baseline_points.get(pos, 0)
-        vbd = total_points - baseline
-        # Assemble notes
-        if player.get("TIERS"):
-            note += f"Tier {player.get('TIERS')}, "
-        if player.get("BYE"):
-            note += f"Bye wk {player.get('BYE')}, "
-        # Trim trailing comma
-        note = note.rstrip(", ")
-        values.append(total_points)
+                note += f"Tough schedule ({int(diff*5)}%), "
+
+        # Coaching tendencies (small)
+        cmod = coach.get(team, {})
+        coach_mult = 1.0
+        if pos == "RB":
+            coach_mult *= float(cmod.get("rush_rate", 1.0))
+        if pos in ("QB", "WR", "TE"):
+            coach_mult *= float(cmod.get("pass_rate", 1.0))
+        coach_mult *= float(cmod.get("pace", 1.0))
+
+        total = base * sched_mult * coach_mult
+        baseline = baseline_points.get(pos, 0.0)
+        vbd = total - baseline
+
+        if str(row.get("TIERS", "")).strip():
+            note += f"Tier {row.get('TIERS')}, "
+        if str(row.get("BYE", "")).strip() and pos != "DST":
+            note += f"Bye wk {row.get('BYE')}, "
+
+        values.append(total)
         vbds.append(vbd)
-        notes_list.append(note)
-    df["value"] = values
-    df["vbd"] = vbds
-    df["notes"] = notes_list
-    # Sort by value descending
-    df = df.sort_values("value", ascending=False)
-    return df
+        notes.append(note.rstrip(", "))
+
+    out["value"] = values
+    out["vbd"] = vbds
+    out["notes"] = notes
+
+    out = out.sort_values(["value", "vbd"], ascending=[False, False]).reset_index(drop=True)
+    return out
