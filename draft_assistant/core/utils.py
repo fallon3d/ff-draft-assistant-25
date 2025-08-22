@@ -1,17 +1,16 @@
 """
-Utilities: config, file I/O, header normalization, simple math for draft
+Utilities: config I/O, player table normalization, draft math, simple helpers
 """
 
 from __future__ import annotations
 import os
 import re
-import json
 import toml
 import pandas as pd
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.toml")
 
-# ---------------- Config ----------------
+# -------- Config --------
 def read_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         return {}
@@ -24,16 +23,15 @@ def save_config(cfg: dict) -> None:
     with open(CONFIG_PATH, "w") as f:
         toml.dump(cfg, f)
 
-# ---------------- Header normalization ----------------
+# -------- Headers --------
 def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize column names from user CSV/XLSX to the app's schema.
-    Accepts:
+    Normalize column names from user CSV/XLSX to the app schema.
+    Supports:
       - HEAD COACH -> COACH
       - OFFENSE COORDINATOR -> OC
-      - BYE WEEK or BYE (keeps both, mirrors values)
-    Uppercases TEAM/POS, maps DEF/DST variants, coerces ROOKIE->0/1.
-    Leaves extra columns intact.
+      - BYE WEEK/BYE mirrored
+    Uppercases TEAM/POS, maps DEF variants to DST, coerces ROOKIE->0/1.
     """
     if df is None or df.empty:
         return df
@@ -46,8 +44,7 @@ def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
     alias_map = {
         "RK": {"rk", "overall rank", "rank", "overall"},
         "TIERS": {"tier", "tiers", "tier rank"},
-        "PLAYER": {"player", "player name", "name", "player_name"},
-        "PLAYER NAME": {"player name"},  # accept exact human header
+        "PLAYER": {"player", "player name", "name", "player_name", "playername"},
         "TEAM": {"team", "nfl team", "tm"},
         "POS": {"pos", "position"},
         "BYE WEEK": {"bye week", "bye wk", "byeweek"},
@@ -76,12 +73,11 @@ def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
         "HANDCUFF_TO": {"handcuff to", "handcuff", "backs up"},
         "TEAM_TENDENCY": {"team tendency", "tendency", "offense tendency"},
         "COACH": {"coach", "head coach", "hc"},
-        "OC": {"offense coordinator", "offensive coordinator", "oc", "off coord"},
+        "OC": {"offense coordinator", "offensive coordinator", "oc", "off coord", "offense coord"},
         "STATUS": {"status"},
         "NOTES": {"notes", "comment"},
     }
 
-    # Build inverse lookup
     canon_to_std = {}
     for std, aliases in alias_map.items():
         for a in aliases:
@@ -94,7 +90,7 @@ def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
         if c in canon_to_std:
             rename_map[col] = canon_to_std[c]
         elif c == "player name":
-            rename_map[col] = "PLAYER"  # prefer PLAYER
+            rename_map[col] = "PLAYER"
 
     if rename_map:
         df = df.rename(columns=rename_map)
@@ -120,22 +116,17 @@ def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
     if "ROOKIE" in df.columns:
         def _rook(v):
             s = str(v).strip().lower()
-            if s in {"1", "true", "yes", "y"}:
-                return 1
-            if s in {"0", "false", "no", "n", ""}:
-                return 0
+            if s in {"1","true","yes","y"}: return 1
+            if s in {"0","false","no","n",""}: return 0
             return 1 if "rook" in s else 0
         df["ROOKIE"] = df["ROOKIE"].map(_rook)
 
     # Ensure essential columns exist
     for col in ["PLAYER","TEAM","POS"]:
-        if col not in df.columns:
-            df[col] = None
+        if col not in df.columns: df[col] = None
     for col in ["BYE","BYE WEEK"]:
-        if col not in df.columns:
-            df[col] = None
+        if col not in df.columns: df[col] = None
 
-    # Preferred order (keep extras at end)
     preferred = [
         "RK","TIERS","PLAYER","TEAM","POS","BYE WEEK","BYE",
         "ECR","ADP","ECR VS. ADP","SOS SEASON","PROJ_PTS",
@@ -148,11 +139,8 @@ def normalize_player_headers(df: pd.DataFrame) -> pd.DataFrame:
     ordered = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
     return df[ordered]
 
-# ---------------- Loader (CSV or Excel) ----------------
+# -------- Loader (CSV/XLSX) --------
 def read_player_table(path: str) -> pd.DataFrame:
-    """
-    Read CSV/XLSX, normalize headers, coerce numeric fields, and return DataFrame.
-    """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     ext = os.path.splitext(path)[1].lower()
@@ -162,7 +150,6 @@ def read_player_table(path: str) -> pd.DataFrame:
         df = pd.read_csv(path)
     df = normalize_player_headers(df)
 
-    # Coerce numeric columns where possible
     numeric_cols = [
         "RK","TIERS","BYE","BYE WEEK","ECR","ADP","ECR VS. ADP","SOS SEASON","PROJ_PTS",
         "PROJ_PASS_YDS","PROJ_PASS_TD","PROJ_RUSH_YDS","PROJ_RUSH_TD",
@@ -173,62 +160,42 @@ def read_player_table(path: str) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Clean names
     if "PLAYER" in df.columns:
         df["PLAYER"] = df["PLAYER"].astype(str).str.strip()
 
     return df
 
-# ---------------- Draft math helpers ----------------
+# -------- Draft math --------
 def snake_position(overall_pick: int, teams: int) -> tuple[int,int,int]:
-    """
-    Given overall pick (1-indexed) and teams, return (round, pick_in_round, slot).
-    """
     r = (overall_pick - 1) // teams + 1
     pos_in_round = (overall_pick - 1) % teams + 1
-    if r % 2 == 1:
-        slot = pos_in_round
-    else:
-        slot = teams - pos_in_round + 1
+    slot = pos_in_round if (r % 2 == 1) else (teams - pos_in_round + 1)
     return r, pos_in_round, slot
 
+def slot_for_overall(overall_pick: int, teams: int) -> int:
+    return snake_position(overall_pick, teams)[2]
+
 def picks_until_next_turn(current_overall: int, teams: int, user_slot: int) -> int:
-    """
-    How many picks occur before your next selection given snake format.
-    """
     r, p, slot = snake_position(current_overall, teams)
-    # Picks remaining in current round
-    if slot < user_slot and r % 2 == 1:
-        # your pick later this round
-        return user_slot - slot
-    if slot > user_slot and r % 2 == 0:
-        return slot - user_slot
-    # Otherwise to end + wrap around
+    if (r % 2 == 1 and slot < user_slot) or (r % 2 == 0 and slot > user_slot):
+        return abs(user_slot - slot)
     to_end = teams - slot
     to_next = (user_slot - 1) if r % 2 == 1 else (teams - user_slot)
-    return to_end + to_next + 1  # +1 accounts for your next pick slot
+    return to_end + to_next + 1
 
 def next_pick_overall(start_overall_after_current: int, teams: int, user_slot: int) -> int:
-    """
-    Return the overall pick number of your subsequent pick after the next one.
-    """
     n1 = start_overall_after_current
-    r1, p1, s1 = snake_position(n1, teams)
-    # compute to your following pick from there
     return n1 + picks_until_next_turn(n1, teams, user_slot) + 1
 
 def user_roster_id(users: list[dict], username: str) -> int | None:
-    if not users:
-        return None
+    if not users: return None
     for u in users:
         if str(u.get("display_name","")).strip().lower() == str(username).strip().lower():
-            rid = u.get("metadata", {}).get("team_name") or u.get("roster_id")
             return int(u.get("roster_id") or 1)
     return None
 
 def slot_to_display_name(slot: int, users: list[dict]) -> str:
-    if not users:
-        return f"Slot {slot}"
+    if not users: return f"Slot {slot}"
     for u in users:
         if int(u.get("roster_id", -1)) == int(slot):
             nm = u.get("metadata", {}).get("team_name") or u.get("display_name") or f"Slot {slot}"
@@ -249,8 +216,6 @@ def lookup_bye_weeks(full_df: pd.DataFrame, names: list[str]) -> set[int]:
     for n in names:
         v = m.get(n)
         if pd.notna(v):
-            try:
-                out.add(int(v))
-            except Exception:
-                pass
+            try: out.add(int(v))
+            except Exception: pass
     return out
