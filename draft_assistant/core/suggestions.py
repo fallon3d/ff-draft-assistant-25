@@ -1,10 +1,9 @@
 """
 Suggestion engine:
-- Weighted blend of value & VBD
-- Heuristics for ECR vs ADP, injury risk, volatility (late rounds), K/DST timing
-- "Likely gone" / "Might make it" based on intervening picks
-- Bye conflict note (light penalty)
-- Needs-aware scoring (avoid doubling QB/TE early; fill starters first)
+- Weighted blend of value & VBD, plus ECR vs ADP, risk, volatility late-round bump.
+- Needs-aware, tier scarcity, run detection, K/DST timing, bye conflict (light).
+- "Likely gone / Might make it" based on intervening picks to your next turn.
+- Strategy chooser re-evaluated every pick.
 """
 
 import math
@@ -24,8 +23,7 @@ def _pos_counts_from_names(names: List[str], universe: pd.DataFrame) -> dict:
     out = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DST":0}
     for n in names:
         p = m.get(n)
-        if p in out:
-            out[p] += 1
+        if p in out: out[p] += 1
     return out
 
 def needs_summary(available_df, user_picked_names: List[str], user_pos_counts: Optional[Dict[str,int]]=None) -> str:
@@ -39,16 +37,14 @@ def needs_summary(available_df, user_picked_names: List[str], user_pos_counts: O
 
 def _rookie_flag(row: pd.Series) -> bool:
     try:
-        if "ROOKIE" in row.index and int(row["ROOKIE"]) == 1:
-            return True
+        if "ROOKIE" in row.index and int(row["ROOKIE"]) == 1: return True
     except Exception:
         pass
     s = str(row.get("TIERS","")).strip().lower()
     return ("rookie" in s) or (s == "r")
 
 def _likely_gone_prob(rank: int, intervening_picks: int) -> float:
-    if rank <= 0:
-        rank = 999
+    if rank <= 0: rank = 999
     x = (intervening_picks - max(0, 25 - rank*0.2)) / 8.0
     return 1.0 / (1.0 + math.exp(-x))
 
@@ -67,28 +63,20 @@ def _tier_map(df: pd.DataFrame) -> Dict[str, int]:
     return tm
 
 def detect_run(pick_log: List[dict], recent: int = 6) -> str:
-    if not pick_log:
-        return ""
+    if not pick_log: return ""
     last = pick_log[-recent:]
     pos = [p.get("metadata", {}).get("position", "") for p in last if p.get("metadata")]
     pos = [p for p in pos if p]
     if len(pos) >= 4 and len(set(pos)) <= 2:
         for candidate in ("WR","RB","QB","TE","K","DST"):
-            if pos.count(candidate) >= 4:
-                return candidate
+            if pos.count(candidate) >= 4: return candidate
     return ""
 
 def _scarcity_bonus(pos: str, top_tier_left: bool) -> float:
     base = 0.0
-    if pos in ("TE","QB"):
-        base += 0.03
-    if top_tier_left:
-        base += 0.02
+    if pos in ("TE","QB"): base += 0.03
+    if top_tier_left: base += 0.02
     return base
-
-def _injury_mult(s: str) -> float:
-    s = str(s or "").strip().lower()
-    return {"low":1.00, "medium":0.97, "high":0.94}.get(s, 1.0)
 
 def rank_suggestions(
     available_df,
@@ -106,46 +94,37 @@ def rank_suggestions(
     weights: Optional[Dict[str,float]] = None,
 ) -> pd.DataFrame:
     """
-    Weighted score:
-      score = value * (1 + scarcity + run + late K/DST) * injury_mult
-              + w_vbd * vbd
-              + w_ecr_delta * (ECR VS. ADP)
-              + volatility late-round bump
-              - small bye conflict penalty
-    Plus need-awareness and early duplicate avoidance (QB/TE).
+    score = base(value)
+          + w_vbd * vbd
+          + w_ecr * (ECR VS. ADP)
+          +/- risk & volatility
+          * (needs, scarcity, run, K/DST timing adjustments)
+          - light bye conflict
     """
     if available_df is None or getattr(available_df, "empty", True):
         return pd.DataFrame(columns=["PLAYER","POS","TEAM","score","why","value","vbd","next_turn_tag"])
 
     df = available_df.copy()
     for c in ["value","vbd","RK","TIERS","BYE","POS","TEAM","PLAYER","ECR VS. ADP","INJURY_RISK","VOLATILITY"]:
-        if c not in df.columns:
-            df[c] = 0
+        if c not in df.columns: df[c] = 0
 
-    # Weights
     w_vbd = float(weights.get("w_vbd", 0.35)) if weights else 0.35
     w_ecr = float(weights.get("w_ecr_delta", 0.12)) if weights else 0.12
     w_inj = float(weights.get("w_injury", 0.06)) if weights else 0.06
     w_vol = float(weights.get("w_vol", 0.05)) if weights else 0.05
 
-    # Needs / counts
-    if user_pos_counts is not None:
-        counts = {k: int(user_pos_counts.get(k, 0)) for k in ("QB","RB","WR","TE","K","DST")}
-    else:
-        counts = _pos_counts_from_names(user_picked_names, df)
-
+    counts = {k: int(user_pos_counts.get(k, 0)) for k in ("QB","RB","WR","TE","K","DST")} if user_pos_counts is not None else _pos_counts_from_names(user_picked_names, df)
     tm = _tier_map(df)
     run_pos = detect_run(pick_log)
 
-    # Intervening picks
     if current_overall and user_slot:
         intervening = utils.picks_until_next_turn(current_overall, int(teams), int(user_slot))
     else:
         intervening = max(0, teams - 1)
 
     last_third = round_number >= max(8, int(total_rounds * (2/3.0)))
-    late_k_dst_round = total_rounds  # K/DST only last round if flag set
     user_bye_weeks = user_bye_weeks or set()
+    late_k_dst_round = total_rounds  # enforce "final round" behavior
 
     rows = []
     for _, row in df.iterrows():
@@ -162,17 +141,13 @@ def rank_suggestions(
         score = base
         why_bits.append(f"value {base:.1f}")
 
-        # VBD weight
         score += w_vbd * vbd
-        if vbd != 0:
-            why_bits.append(f"VBD {vbd:+.1f}")
+        if vbd != 0: why_bits.append(f"VBD {vbd:+.1f}")
 
-        # ECR vs ADP (value hunting)
         if ecr_delta:
             score += w_ecr * ecr_delta
             why_bits.append(f"value vs ADP {ecr_delta:+.1f}")
 
-        # Needs awareness
         need_gap = max(0, STARTERS.get(pos, 0) - counts.get(pos, 0))
         if need_gap > 0:
             score *= 1.10
@@ -181,7 +156,6 @@ def rank_suggestions(
             score *= 0.90
             why_bits.append("deprioritize duplicate early")
 
-        # Tier scarcity + run
         try:
             cur_tier = int(str(row.get("TIERS","") or "999"))
             top_tier_left = (cur_tier == tm.get(pos, 999))
@@ -195,28 +169,23 @@ def rank_suggestions(
             score *= 1.05
             why_bits.append(f"{pos} run")
 
-        # K/DST timing
-        if pos in ("K","DST"):
-            if (round_number < late_k_dst_round):
-                score *= 0.65
-                why_bits.append("delay K/DST until late")
+        if pos in ("K","DST") and (round_number < late_k_dst_round):
+            score *= 0.65
+            why_bits.append("delay K/DST until late")
 
-        # Injury risk penalty (soft)
-        score *= (1.0 - w_inj) if inj == "high" else (1.0 - w_inj/2.0) if inj == "medium" else score
-        if inj in ("medium","high"):
-            why_bits.append(f"inury risk: {inj}")
+        # Risk penalty
+        if inj == "high": score *= (1.0 - w_inj)
+        elif inj == "medium": score *= (1.0 - w_inj/2.0)
+        if inj in ("medium","high"): why_bits.append(f"injury risk: {inj}")
 
-        # Volatility late-round bump
         if last_third and vol in ("medium","high"):
             score *= (1.0 + (w_vol if vol == "high" else w_vol/2.0))
             why_bits.append("late-round volatility upside")
 
-        # Likely gone / might make it
         gone_p = _likely_gone_prob(rk, intervening)
         score *= (1.0 + 0.10 * gone_p)
         next_turn_tag = "🔥 likely gone" if gone_p >= 0.65 else ("⏳ might make it" if gone_p <= 0.35 else "")
 
-        # Bye conflict (light)
         if bye and bye in user_bye_weeks and pos in ("RB","WR","TE","QB"):
             score *= 0.98
             why_bits.append(f"bye conflict (wk {bye})")
@@ -230,7 +199,7 @@ def rank_suggestions(
     out = pd.DataFrame(rows).sort_values(["score","value","vbd"], ascending=False).reset_index(drop=True)
     return out
 
-# ---------- Strategy (same as earlier, uses value for detection) ----------
+# ---------- Strategy ----------
 STRATS = {
     "Anchor WR + Early Elite TE": {
         "name": "Anchor WR + Early Elite TE (default)",
@@ -250,8 +219,7 @@ STRATS = {
 }
 
 def _simulate_board(df: pd.DataFrame, picks_to_remove: int) -> pd.DataFrame:
-    if picks_to_remove <= 0 or df.empty:
-        return df
+    if picks_to_remove <= 0 or df.empty: return df
     return df.sort_values("value", ascending=False).iloc[picks_to_remove:].reset_index(drop=True)
 
 def _best_for_positions(df: pd.DataFrame, pos_choices: List[str]) -> float:
