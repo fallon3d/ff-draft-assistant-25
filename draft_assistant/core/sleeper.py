@@ -149,11 +149,11 @@ def picks_to_internal_log(picks: List[dict], players_map: dict, teams: int | Non
     return out
 
 
-# ---------------- NEW: Picked names helper ----------------
+# ---------------- Picked names helper ----------------
 def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
     """
     Build a set of drafted player names as strings that match our CSV 'PLAYER' field
-    as closely as possible: 'First Last' when available, falling back to players_map.
+    as closely as possible: 'First Last' when available, falling back to /players/nfl map.
 
     For DST/K edge cases we also try:
       - metadata.name (if provided)
@@ -182,11 +182,7 @@ def picked_player_names(picks: List[dict], players_map: dict) -> set[str]:
         if not full:
             full = (meta.get("name") or "").strip()
 
-        # Add if we have anything at all
         if full:
             out.add(full)
-
-        # Note: some DST names in Sleeper won't exactly match CSV (e.g., "San Francisco 49ers" vs "49ers D/ST").
-        # We intentionally avoid guessing here; the app keeps those rows available unless the CSV uses matching names.
 
     return out
