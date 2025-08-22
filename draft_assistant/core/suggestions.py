@@ -1,8 +1,8 @@
 """
-Suggestion engine (revamped):
-- Strong early QB/TE deferral (unless elite or stack leverage).
-- Dynamic strategies incl. Zero WR, Hero/Modified Zero RB, Late QB/TE, BPA, Barbell-lite.
-- Tier-based scarcity, run detection, handcuff priority, bye conflict, punt positions.
+Suggestion engine (revamped, with strict early-QB deferral):
+- Strong QB deferral before a configured round (default R8) — QBs won't top the board early.
+- Dynamic strategies incl. Zero WR, Modified Zero RB / Hero RB, Late QB/TE, BPA.
+- Tier scarcity, run detection, handcuff priority, bye conflict, stack leverage (post-deferral).
 - "Likely gone / Might make it" based on intervening picks.
 """
 
@@ -12,15 +12,17 @@ import pandas as pd
 
 from . import utils
 
-# --- knobs (some can be overridden via config.strategy) ---
+# --- knobs (some overridden via config.strategy) ---
 STARTERS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "K": 1, "DST": 1}
 MAX_AT_POS_EARLY = {"QB": 1, "TE": 1}   # avoid duplicates early
-EARLY_ROUNDS = 6                        # definition for "early"
-DEFAULT_EARLY_QB_ROUND = 7              # defer QB before this round unless elite/stack
-DEFAULT_EARLY_TE_ROUND = 6              # defer TE before this round unless elite/stack
-DEFAULT_ELITE_QB_POS_RANK = 3           # top-3 positional rank counts as elite QB window
-DEFAULT_STACK_BONUS = 0.06              # stack leverage bump
-HANDCUFF_LATE_ROUND = 9                 # start prioritizing handcuffs after this
+EARLY_ROUNDS = 6
+DEFAULT_EARLY_QB_ROUND = 7              # legacy soft deferral (still used if no hard gate)
+DEFAULT_QB_FORBID_BEFORE = 8            # NEW: hard gate — don't take QB before this round
+DEFAULT_EARLY_TE_ROUND = 6
+DEFAULT_ELITE_QB_POS_RANK = 3
+DEFAULT_STACK_BONUS = 0.06
+HANDCUFF_LATE_ROUND = 9
+
 
 def _pos_counts_from_names(names: List[str], universe: pd.DataFrame) -> dict:
     if not names or universe is None or universe.empty:
@@ -32,6 +34,7 @@ def _pos_counts_from_names(names: List[str], universe: pd.DataFrame) -> dict:
         if p in out: out[p] += 1
     return out
 
+
 def needs_summary(available_df, user_picked_names: List[str], user_pos_counts: Optional[Dict[str,int]]=None) -> str:
     counts = (
         {k:int(user_pos_counts.get(k,0)) for k in ("QB","RB","WR","TE","K","DST")}
@@ -41,6 +44,7 @@ def needs_summary(available_df, user_picked_names: List[str], user_pos_counts: O
     parts = [f"{v} {k}" for k, v in needs.items() if v > 0]
     return f"You still need: {', '.join(parts)}" if parts else "Starters filled — build depth and upside."
 
+
 def _rookie_flag(row: pd.Series) -> bool:
     try:
         if "ROOKIE" in row.index and int(row["ROOKIE"]) == 1: return True
@@ -49,10 +53,12 @@ def _rookie_flag(row: pd.Series) -> bool:
     s = str(row.get("TIERS","")).strip().lower()
     return ("rookie" in s) or (s == "r")
 
+
 def _likely_gone_prob(rank: int, intervening_picks: int) -> float:
     if rank <= 0: rank = 999
     x = (intervening_picks - max(0, 25 - rank*0.2)) / 8.0
     return 1.0 / (1.0 + math.exp(-x))
+
 
 def _tier_map(df: pd.DataFrame) -> Dict[str, int]:
     tm = {}
@@ -68,6 +74,7 @@ def _tier_map(df: pd.DataFrame) -> Dict[str, int]:
             tm[pos] = 999
     return tm
 
+
 def detect_run(pick_log: List[dict], recent: int = 6) -> str:
     if not pick_log: return ""
     last = pick_log[-recent:]
@@ -78,8 +85,8 @@ def detect_run(pick_log: List[dict], recent: int = 6) -> str:
             if pos.count(candidate) >= 4: return candidate
     return ""
 
+
 def _scarcity_bonus(pos: str, remaining_in_top_tier: int) -> float:
-    # stronger bump when a top tier is about to disappear
     if remaining_in_top_tier <= 1:
         return 0.07
     if remaining_in_top_tier <= 2:
@@ -88,10 +95,8 @@ def _scarcity_bonus(pos: str, remaining_in_top_tier: int) -> float:
         return 0.03
     return 0.0
 
+
 def _pos_rank_map(df: pd.DataFrame) -> Dict[int, int]:
-    """
-    Returns a map index->pos_rank (1 = best at position) using 'value'.
-    """
     pos_rank = {}
     for pos in ("QB","RB","WR","TE","K","DST"):
         sub = df[df["POS"] == pos].sort_values("value", ascending=False).reset_index()
@@ -99,10 +104,8 @@ def _pos_rank_map(df: pd.DataFrame) -> Dict[int, int]:
             pos_rank[int(row["index"])] = i
     return pos_rank
 
+
 def _build_stack_state(user_picked_names: List[str], universe_df: pd.DataFrame) -> Dict[str, set]:
-    """
-    Build sets of teams per position the user already has, so we can stack with QB/WR/TE.
-    """
     if universe_df is None or universe_df.empty:
         return {"QB": set(), "WR": set(), "TE": set()}
     m_team = universe_df.set_index("PLAYER")["TEAM"].to_dict()
@@ -112,6 +115,7 @@ def _build_stack_state(user_picked_names: List[str], universe_df: pd.DataFrame) 
         t = m_team.get(n); p = m_pos.get(n)
         if t and p in have: have[p].add(t)
     return have
+
 
 def rank_suggestions(
     available_df,
@@ -131,12 +135,8 @@ def rank_suggestions(
     config: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """
-    score = base(value)
-          + w_vbd * vbd
-          + w_ecr * (ECR VS. ADP)
-          +/- risk & volatility
-          * (needs, scarcity, run, K/DST timing, QB/TE deferral, stack, handcuff, punt)
-          - light bye conflict
+    score = base(value) + w_vbd * vbd + w_ecr * (ECR VS. ADP)
+    Modified by: needs, scarcity, run, K/DST timing, strict early-QB deferral, stack, handcuff, bye.
     """
     if available_df is None or getattr(available_df, "empty", True):
         return pd.DataFrame(columns=["PLAYER","POS","TEAM","score","why","value","vbd","next_turn_tag"])
@@ -147,7 +147,8 @@ def rank_suggestions(
 
     # ---- config knobs ----
     strat_cfg = (config or {}).get("strategy", {}) if config else {}
-    early_qb_round = int(strat_cfg.get("early_qb_round", DEFAULT_EARLY_QB_ROUND))
+    early_qb_round_soft = int(strat_cfg.get("early_qb_round", DEFAULT_EARLY_QB_ROUND))
+    qb_forbid_before = int(strat_cfg.get("qb_forbid_before_round", DEFAULT_QB_FORBID_BEFORE))  # NEW hard gate
     early_te_round = int(strat_cfg.get("early_te_round", DEFAULT_EARLY_TE_ROUND))
     elite_qb_pos_rank = int(strat_cfg.get("elite_qb_pos_rank", DEFAULT_ELITE_QB_POS_RANK))
     stack_bonus = float(strat_cfg.get("stack_bonus", DEFAULT_STACK_BONUS))
@@ -163,7 +164,6 @@ def rank_suggestions(
     tm = _tier_map(df)
     run_pos = detect_run(pick_log)
 
-    # Remaining in top tier for scarcity
     remain_top_tier = {}
     for pos in ("QB","RB","WR","TE","K","DST"):
         top_tier = tm.get(pos, 999)
@@ -177,10 +177,7 @@ def rank_suggestions(
     last_third = round_number >= max(8, int(total_rounds * (2/3.0)))
     user_bye_weeks = user_bye_weeks or set()
 
-    # Stacking: what teams do we already have at QB/WR/TE?
     have_stack = _build_stack_state(user_picked_names, universe_df if universe_df is not None else df)
-
-    # Positional rank map
     pos_rank = _pos_rank_map(df)
 
     rows = []
@@ -189,8 +186,8 @@ def rank_suggestions(
         base = float(row.get("value", 0.0))
         vbd = float(row.get("vbd", 0.0))
         rk = int(row.get("RK", 999)) if pd.notna(row.get("RK")) else 999
-        ecr_delta = float(row.get("ECR VS. ADP", 0.0)) if pd.notna(row.get("ECR VS. ADP")) else 0.0
         bye = int(row.get("BYE", 0)) if pd.notna(row.get("BYE")) else 0
+        ecr_delta = float(row.get("ECR VS. ADP", 0.0)) if pd.notna(row.get("ECR VS. ADP")) else 0.0
         inj = str(row.get("INJURY_RISK","")).strip().lower()
         vol = str(row.get("VOLATILITY","")).strip().lower()
         team = str(row.get("TEAM","")).strip().upper()
@@ -236,25 +233,33 @@ def rank_suggestions(
             score *= 0.80
             why_bits.append(f"punting {pos} for now")
 
-        # --- NEW: Early QB/TE deferral unless elite or stacking window ---
+        # -------- STRICT EARLY-QB DEFERRAL (hard gate) --------
+        # If we haven't drafted a QB and we're before the hard gate round, crush QB scores.
+        if pos == "QB" and counts.get("QB",0) == 0 and round_number < qb_forbid_before:
+            score *= 0.35  # strong downweight so QB won't top early lists
+            why_bits.append(f"QB deferred until R{qb_forbid_before}")
+
+        # --- Soft early timing for QB/TE (still applies after the hard gate window) ---
         pr = int(pos_rank.get(int(idx), 99))
-        if pos == "QB" and counts.get("QB",0) == 0 and round_number < early_qb_round:
-            elite_qb_window = (pr <= elite_qb_pos_rank)
-            stack_here = (team in have_stack.get("WR",set()) or team in have_stack.get("TE",set()))
-            if not (elite_qb_window or stack_here):
-                score *= 0.82
-                why_bits.append(f"wait on QB (rank {pr})")
-            elif stack_here:
-                score *= (1.0 + stack_bonus)
-                why_bits.append("QB stack leverage")
+        if pos == "QB" and counts.get("QB",0) == 0 and round_number < early_qb_round_soft:
+            # If hard gate still active, the penalty above already hit; keep stack/elite bonuses off during hard gate.
+            if round_number >= qb_forbid_before:
+                elite_qb_window = (pr <= elite_qb_pos_rank)
+                stack_here = (team in have_stack.get("WR",set()) or team in have_stack.get("TE",set()))
+                if not (elite_qb_window or stack_here):
+                    score *= 0.82
+                    why_bits.append(f"wait on QB (rank {pr})")
+                elif stack_here:
+                    score *= (1.0 + stack_bonus)
+                    why_bits.append("QB stack leverage")
+
         if pos == "TE" and counts.get("TE",0) == 0 and round_number < early_te_round:
-            # treat top-2 TE by value as "elite window"
             elite_te_window = (pr <= 2)
             if not elite_te_window:
                 score *= 0.88
                 why_bits.append(f"wait on TE (rank {pr})")
 
-        # Stacking bonus for WR/TE with your QB (or vice versa handled above)
+        # Stacking bonus for WR/TE with your QB (always allowed)
         if pos in ("WR","TE") and team in have_stack.get("QB", set()):
             score *= (1.0 + stack_bonus)
             why_bits.append(f"stack with your QB ({team})")
@@ -262,12 +267,11 @@ def rank_suggestions(
         # Handcuff priority (late rounds)
         handcuff_to = str(row.get("HANDCUFF_TO","")).strip()
         if round_number >= HANDCUFF_LATE_ROUND and handcuff_to:
-            # simple check: if you roster the starter, bump his handcuff
             if any(handcuff_to.lower() == n.lower() for n in user_picked_names):
                 score *= 1.08
                 why_bits.append(f"protect your {handcuff_to} (handcuff)")
 
-        # Risk & late-volatility handling (Upside in late rounds)
+        # Risk & late-volatility handling
         if inj == "high": score *= (1.0 - w_inj)
         elif inj == "medium": score *= (1.0 - w_inj/2.0)
         if inj in ("medium","high"): why_bits.append(f"injury risk: {inj}")
@@ -275,12 +279,13 @@ def rank_suggestions(
         if _rookie_flag(row) and round_number >= HANDCUFF_LATE_ROUND:
             score *= 1.05
             why_bits.append("late rookie ceiling")
-        if last_third and vol in ("medium","high"):
-            score *= (1.0 + (w_vol if vol == "high" else w_vol/2.0))
+
+        if round_number >= max(8, int(total_rounds * (2/3.0))) and str(row.get("VOLATILITY","")).strip().lower() in ("medium","high"):
+            score *= (1.0 + (w_vol if str(row.get("VOLATILITY","")).strip().lower() == "high" else w_vol/2.0))
             why_bits.append("late-round volatility upside")
 
         # Availability to next turn
-        gone_p = _likely_gone_prob(rk, intervening)
+        gone_p = _likely_gone_prob(int(row.get("RK", 999)) if pd.notna(row.get("RK")) else 999, intervening)
         score *= (1.0 + 0.10 * gone_p)
         next_turn_tag = "🔥 likely gone" if gone_p >= 0.65 else ("⏳ might make it" if gone_p <= 0.35 else "")
 
@@ -297,6 +302,7 @@ def rank_suggestions(
 
     out = pd.DataFrame(rows).sort_values(["score","value","vbd"], ascending=False).reset_index(drop=True)
     return out
+
 
 # ---------------- Strategy chooser ----------------
 
@@ -317,8 +323,8 @@ STRATS = {
         "why": "Secure bell-cow RB floor, then flood WR/TE value.",
     },
     "Zero WR": {
-        "name": "Zero WR (RB/QB/TE early, fill WR later)",
-        "plan": [["RB","TE","QB"], ["RB","TE","QB"], ["RB"]],
+        "name": "Zero WR (RB/TE early, fill WR later)",
+        "plan": [["RB","TE"], ["RB","TE"], ["RB"]],
         "why": "Exploit RB scarcity; WR depth later in half/standard scoring.",
     },
     "Late QB/TE": {
@@ -328,8 +334,8 @@ STRATS = {
     },
     "BPA": {
         "name": "Best Player Available",
-        "plan": [["WR","RB","TE","QB"], ["WR","RB","TE","QB"], ["WR","RB","TE","QB"]],
-        "why": "Always maximize value regardless of position.",
+        "plan": [["WR","RB","TE"], ["WR","RB","TE"], ["WR","RB","TE"]],
+        "why": "Always maximize value regardless of position (QB deferred by policy).",
     },
 }
 
@@ -355,13 +361,33 @@ def choose_strategy(
     hero_rb_value: float = 85.0,
     preferred_name: Optional[str] = None,
     prefer_margin: float = 0.05,
+    user_pos_counts: Optional[Dict[str,int]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Evaluate strategies across the next ~3 decisions. QB picks are ignored before qb_forbid_before_round.
+    """
     if available_df is None or getattr(available_df, "empty", True):
         return {"name":"Anchor WR + Early Elite TE (default)","why":"Empty board fallback.","score":0.0}
 
     df = available_df.copy()
     if "value" not in df.columns:
         df["value"] = 50.0
+
+    strat_cfg = (config or {}).get("strategy", {}) if config else {}
+    qb_forbid_before = int(strat_cfg.get("qb_forbid_before_round", DEFAULT_QB_FORBID_BEFORE))
+
+    # Where are we now?
+    rd, _, _ = utils.snake_position(current_overall, teams)
+    have_qb = int((user_pos_counts or {}).get("QB", 0)) > 0
+
+    # Helper to remove QB from target choices during the hard deferral window
+    def _sanitize(choices: List[str], round_num: int) -> List[str]:
+        if not have_qb and round_num < qb_forbid_before and "QB" in choices:
+            out = [c for c in choices if c != "QB"]
+            # sensible fallback if all were QB
+            return out or ["WR","RB","TE"]
+        return choices
 
     picks_to_next = utils.picks_until_next_turn(current_overall, teams, user_slot)
     next_overall_1 = current_overall
@@ -376,29 +402,33 @@ def choose_strategy(
     top_rb_now = _top_value_at_pos(df, "RB")
     hero_rb_now = top_rb_now >= hero_rb_value
 
-    # Evaluate strategies by summing the best attainable values across next 3 decisions
     candidates = list(STRATS.items())
     scores = []
     for key, meta in candidates:
         plan = [p[:] for p in meta["plan"]]
+
         # Dynamic nudges
         if key == "Anchor WR + Early Elite TE" and not (elite_te_now or elite_te_wont_last):
             plan[1] = ["WR"]
         if key == "Hero RB + WR Flood" and not hero_rb_now:
             plan[0] = ["WR"]
 
+        # Apply QB deferral to the next three decision windows
+        plan0 = _sanitize(plan[0], rd)
+        plan1 = _sanitize(plan[1], rd + 1) if len(plan) > 1 else ["WR","RB","TE"]
+        plan2 = _sanitize(plan[2] if len(plan) > 2 else ["WR","RB","TE"], rd + 2)
+
         v_total = 0.0
         board_now = df.sort_values("value", ascending=False).reset_index(drop=True)
-        v_total += _best_for_positions(board_now, plan[0])
+        v_total += _best_for_positions(board_now, plan0)
 
-        board_after1 = board_now.drop(board_now[board_now["POS"].isin(plan[0])].head(1).index).reset_index(drop=True)
+        board_after1 = board_now.drop(board_now[board_now["POS"].isin(plan0)].head(1).index).reset_index(drop=True)
         board_at_turn2 = _simulate_board(board_after1, picks_to_next)
-        v_total += _best_for_positions(board_at_turn2, plan[1])
+        v_total += _best_for_positions(board_at_turn2, plan1)
 
-        board_after2 = board_at_turn2.drop(board_at_turn2[board_at_turn2["POS"].isin(plan[1])].head(1).index).reset_index(drop=True)
+        board_after2 = board_at_turn2.drop(board_at_turn2[board_at_turn2["POS"].isin(plan1)].head(1).index).reset_index(drop=True)
         board_at_turn3 = _simulate_board(board_after2, picks_between_second)
-        want3 = plan[2] if len(plan) > 2 else ["WR","RB","TE","QB"]
-        v_total += _best_for_positions(board_at_turn3, want3)
+        v_total += _best_for_positions(board_at_turn3, plan2)
 
         scores.append((key, v_total, meta["why"]))
 
