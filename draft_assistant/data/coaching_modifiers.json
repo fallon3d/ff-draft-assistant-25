@@ -1,0 +1,72 @@
+{
+  "SF": {
+    "rush_rate": 1.05,
+    "pass_rate": 0.95,
+    "pace": 1.0
+  },
+  "KC": {
+    "rush_rate": 0.9,
+    "pass_rate": 1.1,
+    "pace": 1.0
+  },
+  "MIA": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.1
+  },
+  "LAC": {
+    "rush_rate": 0.95,
+    "pass_rate": 1.05,
+    "pace": 1.0
+  },
+  "DAL": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 0.9
+  },
+  "LV": {
+    "rush_rate": 1.1,
+    "pass_rate": 0.9,
+    "pace": 1.0
+  },
+  "BUF": {
+    "rush_rate": 0.9,
+    "pass_rate": 1.1,
+    "pace": 1.05
+  },
+  "IND": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.0
+  },
+  "CIN": {
+    "rush_rate": 0.95,
+    "pass_rate": 1.05,
+    "pace": 1.0
+  },
+  "BAL": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.0
+  },
+  "JAX": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.0
+  },
+  "NYJ": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.0
+  },
+  "MIN": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.0
+  },
+  "CLE": {
+    "rush_rate": 1.0,
+    "pass_rate": 1.0,
+    "pace": 1.0
+  }
+}
