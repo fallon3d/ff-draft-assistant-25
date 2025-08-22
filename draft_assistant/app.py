@@ -135,8 +135,10 @@ def _save_schedule(upload):
         pd.read_csv(upload).to_csv(os.path.join(DATA_DIR, "sample_schedule.csv"), index=False)
         st.sidebar.success("Schedule CSV uploaded.")
 
-if players_file: _save_master(players_file)
-if schedule_file: _save_schedule(schedule_file)
+if players_file:
+    _save_master(players_file)
+if schedule_file:
+    _save_schedule(schedule_file)
 
 if st.sidebar.button("Save Settings"):
     config.setdefault("user_profile", {})["sleeper_username"] = sleeper_username.strip()
@@ -179,17 +181,18 @@ def _user_pos_counts_from_live_picks(picks: list, my_slot: int) -> dict:
         if str(p.get("roster_id")) != str(my_slot):
             continue
         pos = _normalize_pos_for_counts((p.get("metadata") or {}).get("position"))
-        if pos in counts: counts[pos] += 1
+        if pos in counts:
+            counts[pos] += 1
     return counts
 
 def _user_pos_counts_from_mock_log(pick_log: list, my_slot: int, teams: int) -> dict:
     counts = {"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DST":0}
     for p in pick_log or []:
-        overall = (int(p.get("round",0)) - 1) * int(teams) + int(p.get("pick_no",0))
-        _, _, slot = utils.snake_position(overall, int(teams))
-        if int(slot) != int(my_slot): continue
+        if int(p.get("slot") or 0) != int(my_slot):
+            continue
         pos = _normalize_pos_for_counts((p.get("metadata") or {}).get("position"))
-        if pos in counts: counts[pos] += 1
+        if pos in counts:
+            counts[pos] += 1
     return counts
 
 def build_pool(full=False):
@@ -257,7 +260,8 @@ with tab_live:
                 your_bye_weeks = utils.lookup_bye_weeks(full_pool, your_names)
 
                 needs_text = suggestions.needs_summary(evaluated, your_names, user_pos_counts=your_pos_counts)
-                if needs_text: st.info(needs_text)
+                if needs_text:
+                    st.info(needs_text)
 
                 # Dynamic strategy EVERY pick
                 strat = suggestions.choose_strategy(
@@ -268,7 +272,6 @@ with tab_live:
                 )
                 st.info(f"**Recommended strategy now:** {strat['name']} — {strat['why']}")
 
-                # ---- UPDATED: pass universe_df & config ----
                 ranked = suggestions.rank_suggestions(
                     evaluated,
                     round_number=rnd, total_rounds=int(rounds_setting),
@@ -279,8 +282,8 @@ with tab_live:
                     user_bye_weeks=your_bye_weeks,
                     weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                                  w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
-                    universe_df=full_pool,   # NEW
-                    config=config,           # NEW
+                    universe_df=full_pool,   # for stacking/handcuff lookups
+                    config=config,           # early QB/TE, punt positions, etc.
                 ).head(8)
 
                 if ranked.empty:
@@ -291,25 +294,21 @@ with tab_live:
                         st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f} {tag}")
                         st.caption(row['why'])
 
-              with st.expander("Team Rosters (by position)", expanded=False):
-    users = S.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams+1)]
-    simple_picks = []
-    for p in pick_log:
-        # Prefer the slot computed upstream (from Sleeper's draft_slot)
-        sl = p.get("slot") or utils.slot_for_round_pick(int(p.get("round", 0) or 0),
-                                                        int(p.get("pick_no", 0) or 0),
-                                                        teams)
-        simple_picks.append({"roster_id": int(sl), "metadata": p.get("metadata", {})})
-    ros = roster.build_rosters(simple_picks, users)
-    cols = st.columns(3)
-    i = 0
-    for team_name, rmap in ros.items():
-        with cols[i % 3]:
-            highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
-            st.write(f"{highlight}**{team_name}**")
-            for pos, players in rmap.items():
-                if players: st.write(f"- {pos}: {', '.join(players)}")
-        i += 1
+                with st.expander("Team Rosters (by position)", expanded=False):
+                    ros = roster.build_rosters(picks, users)
+                    if not ros:
+                        st.caption("No picks yet.")
+                    else:
+                        cols = st.columns(3)
+                        i = 0
+                        for team_name, rmap in ros.items():
+                            with cols[i % 3]:
+                                highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
+                                st.write(f"{highlight}**{team_name}**")
+                                for pos, players in rmap.items():
+                                    if players:
+                                        st.write(f"- {pos}: {', '.join(players)}")
+                            i += 1
 
 # ===================== MOCK =====================
 with tab_mock:
@@ -342,6 +341,7 @@ with tab_mock:
             teams_from_api = int(dmeta.get("settings", {}).get("teams", config.get("draft", {}).get("teams", 12)) or dmeta.get("teams", 12))
             rounds_from_api = int(dmeta.get("settings", {}).get("rounds", config.get("draft", {}).get("rounds", 15)))
 
+            # Some mock endpoints don't have full 'users'; fall back to generic labels.
             users = dmeta.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams_from_api+1)]
 
             # Build availability by removing picked names
@@ -358,7 +358,7 @@ with tab_mock:
             detected_slot = utils.user_roster_id(users, sleeper_username)
             my_slot = int(user_slot_override) if int(user_slot_override) > 0 else (detected_slot or 1)
 
-            # Robust picks conversion (use teams to infer round/pick_no if needed)
+            # Robust picks conversion (use teams to infer round/pick_no if needed) and carry slot
             pick_log = sleeper.picks_to_internal_log(picks, players_map, teams_from_api)
 
             st.session_state.mock_state = {
@@ -379,7 +379,8 @@ with tab_mock:
 
     if "mock_state" in st.session_state:
         S = st.session_state.mock_state
-        teams = int(S["teams"]); rounds = int(S["rounds"])
+        teams = int(S["teams"])
+        rounds = int(S["rounds"])
         pick_log = S["pick_log"]
         next_overall = len(pick_log) + 1
         rnd, pick_in_rnd, slot = utils.snake_position(next_overall, teams)
@@ -391,10 +392,13 @@ with tab_mock:
             progressed = 0
             while progressed < 50 and not you_on_clock and not S["available"].empty:
                 idx = mock_ai.pick_for_team(S["available"], "Balanced", rnd)
-                if idx is None or idx not in S["available"].index: break
+                if idx is None or idx not in S["available"].index:
+                    break
                 pk = S["available"].loc[idx]
-                pick_log.append({"round": rnd, "pick_no": pick_in_rnd, "team": f"Slot {slot}",
-                                 "metadata": {"first_name": pk["PLAYER"], "last_name": "", "position": pk.get("POS")}})
+                pick_log.append({
+                    "round": rnd, "pick_no": pick_in_rnd, "slot": slot, "roster_id": slot, "team": f"Slot {slot}",
+                    "metadata": {"first_name": pk["PLAYER"], "last_name": "", "position": pk.get("POS")}
+                })
                 S["available"] = S["available"].drop(idx).reset_index(drop=True)
                 next_overall += 1
                 rnd, pick_in_rnd, slot = utils.snake_position(next_overall, teams)
@@ -410,13 +414,14 @@ with tab_mock:
         my_names = [
             (p.get("metadata") or {}).get("first_name", "")
             for p in pick_log
-            if utils.slot_for_overall((p["round"]-1)*teams + p["pick_no"], teams) == S.get("your_roster_id")
+            if int(p.get("slot") or 0) == int(S.get("your_roster_id"))
         ]
         my_pos_counts = _user_pos_counts_from_mock_log(pick_log, S.get("your_roster_id"), teams)
         my_bye_weeks = utils.lookup_bye_weeks(S.get("full_pool", build_pool(full=True)), my_names)
 
         needs_text = suggestions.needs_summary(S["available"], my_names, user_pos_counts=my_pos_counts)
-        if needs_text: st.info(needs_text)
+        if needs_text:
+            st.info(needs_text)
 
         # Dynamic strategy EVERY pick
         strat = suggestions.choose_strategy(
@@ -427,7 +432,6 @@ with tab_mock:
         )
         st.info(f"**Recommended strategy now:** {strat['name']} — {strat['why']}")
 
-        # ---- UPDATED: pass universe_df & config ----
         ranked = suggestions.rank_suggestions(
             S["available"], round_number=rnd, total_rounds=rounds,
             user_picked_names=my_names, pick_log=pick_log, teams=teams,
@@ -437,8 +441,8 @@ with tab_mock:
             user_bye_weeks=my_bye_weeks,
             weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                          w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
-            universe_df=S.get("full_pool", build_pool(full=True)),  # NEW
-            config=config,                                           # NEW
+            universe_df=S.get("full_pool", build_pool(full=True)),
+            config=config,
         ).head(8)
 
         if ranked.empty:
@@ -449,13 +453,17 @@ with tab_mock:
                 st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f} {tag}")
                 st.caption(row['why'])
 
+        # ---------- FIXED INDENTATION + SLOT MAPPING ----------
         with st.expander("Team Rosters (by position)", expanded=False):
             users = S.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams+1)]
             simple_picks = []
             for p in pick_log:
-                overall = (p["round"] - 1) * teams + p["pick_no"]
-                _, _, sl = utils.snake_position(overall, teams)
-                simple_picks.append({"roster_id": sl, "metadata": p.get("metadata", {})})
+                sl = p.get("slot")
+                if not sl:
+                    sl = utils.slot_for_round_pick(int(p.get("round", 0) or 0),
+                                                   int(p.get("pick_no", 0) or 0),
+                                                   teams)
+                simple_picks.append({"roster_id": int(sl), "metadata": p.get("metadata", {})})
             ros = roster.build_rosters(simple_picks, users)
             cols = st.columns(3)
             i = 0
@@ -464,7 +472,8 @@ with tab_mock:
                     highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
                     st.write(f"{highlight}**{team_name}**")
                     for pos, players in rmap.items():
-                        if players: st.write(f"- {pos}: {', '.join(players)}")
+                        if players:
+                            st.write(f"- {pos}: {', '.join(players)}")
                 i += 1
 
         if you_on_clock and rnd <= rounds and not S["available"].empty:
@@ -474,8 +483,10 @@ with tab_mock:
                 if not sel_idx.empty:
                     idx = int(sel_idx[0])
                     pk = S["available"].loc[idx]
-                    pick_log.append({"round": rnd, "pick_no": pick_in_rnd, "team": "You",
-                                     "metadata": {"first_name": pk["PLAYER"], "last_name": "", "position": pk.get("POS")}})
+                    pick_log.append({
+                        "round": rnd, "pick_no": pick_in_rnd, "slot": slot, "roster_id": slot, "team": "You",
+                        "metadata": {"first_name": pk["PLAYER"], "last_name": "", "position": pk.get("POS")}
+                    })
                     S["available"] = S["available"].drop(idx).reset_index(drop=True)
                     S["current_pick"] = next_overall + 1
                     st.session_state.mock_state = S
@@ -487,7 +498,6 @@ with tab_suggest:
     base_df = build_pool(full=True)
     evaluated = evaluation.evaluate_players(base_df, config, teams=int(teams_setting), rounds=int(rounds_setting), weight_proj=float(w_proj))
     st.info(suggestions.needs_summary(evaluated, [], user_pos_counts={"QB":0,"RB":0,"WR":0,"TE":0,"K":0,"DST":0}) or "")
-    # ---- UPDATED: pass universe_df & config ----
     ranked = suggestions.rank_suggestions(
         evaluated, round_number=1, total_rounds=int(rounds_setting),
         user_picked_names=[], pick_log=[], teams=int(teams_setting),
@@ -497,8 +507,8 @@ with tab_suggest:
         user_bye_weeks=set(),
         weights=dict(w_vbd=float(w_vbd), w_ecr_delta=float(w_ecr_delta),
                      w_injury=float(w_injury_pen), w_vol=float(w_volatility)),
-        universe_df=base_df,   # NEW
-        config=config,         # NEW
+        universe_df=base_df,
+        config=config,
     ).head(8)
     for _, row in ranked.iterrows():
         tag = row.get("next_turn_tag", "")
