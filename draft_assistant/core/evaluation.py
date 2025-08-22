@@ -1,12 +1,13 @@
 """
 Evaluation: compute projections, apply modifiers, compute VBD.
+Robust to messy spreadsheet values (e.g., SOS like '—', 'N/A', blanks).
 """
 
 from __future__ import annotations
 from typing import Dict, Any
 import pandas as pd
 
-DEFAULT_STARTERS = {"QB":1, "RB":2, "WR":3, "TE":1, "K":1, "DST":1}
+DEFAULT_STARTERS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "K": 1, "DST": 1}
 
 DEFAULT_SCORING = {
     "ppr": 1.0,
@@ -17,16 +18,22 @@ DEFAULT_SCORING = {
     "sack": 1.0, "turnover": 2.0,
 }
 
-SOS_MULT = {1: 0.92, 2: 0.96, 3: 1.00, 4: 1.04, 5: 1.08}  # ±8%
+# Strength-of-schedule multiplier by star rating (1–5)
+SOS_MULT = {1: 0.92, 2: 0.96, 3: 1.00, 4: 1.04, 5: 1.08}
+
+# Light injury penalties; applied multiplicatively to value
 INJURY_PEN = {"low": 0.0, "medium": -0.03, "high": -0.06}
+
 
 def _coalesce(*vals, default=0.0) -> float:
     for v in vals:
         try:
-            if pd.notna(v): return float(v)
+            if pd.notna(v):
+                return float(v)
         except Exception:
             pass
     return float(default)
+
 
 def _proj_points_row(row: pd.Series, scoring: Dict[str, float]) -> float:
     pts = 0.0
@@ -44,63 +51,79 @@ def _proj_points_row(row: pd.Series, scoring: Dict[str, float]) -> float:
     pts += -0.02 * _coalesce(row.get("PROJ_POINTS_ALLOWED"))
     return pts
 
-def _baseline_index(pos: str, teams: int, starters: Dict[str,int]) -> int:
-    # Baseline = last starter at the position (e.g., RB24 in 12-team 2-RB starters)
+
+def _baseline_index(pos: str, teams: int, starters: Dict[str, int]) -> int:
+    # Baseline = last starter at that position (e.g., RB24 in 12-team, 2 starters)
     return max(1, teams * int(starters.get(pos, 0)))
 
-def _compute_vbd(df: pd.DataFrame, teams: int, starters: Dict[str,int]) -> pd.Series:
+
+def _compute_vbd(df: pd.DataFrame, teams: int, starters: Dict[str, int]) -> pd.Series:
     """
-    Compute VBD against the baseline *after* all value modifiers.
-    Uses df['value'] (falls back to value_blend).
+    Compute VBD against the baseline using df['value'] (or 'value_blend').
     """
     vals = df["value"] if "value" in df.columns else df.get("value_blend", pd.Series(0.0, index=df.index))
     tmp = df.assign(_val=vals)
 
     vbd = pd.Series(0.0, index=df.index, dtype=float)
-    for pos in ("QB","RB","WR","TE","K","DST"):
+    for pos in ("QB", "RB", "WR", "TE", "K", "DST"):
         sub = tmp[tmp["POS"] == pos].sort_values("_val", ascending=False)
         if sub.empty:
             continue
         idx = min(_baseline_index(pos, teams, starters), len(sub))
-        baseline = float(sub.iloc[idx-1]["_val"])
-        # Correct assignment (no attribute setter bug)
+        baseline = float(sub.iloc[idx - 1]["_val"])
         vbd.loc[sub.index] = sub["_val"] - baseline
     return vbd
+
 
 def evaluate_players(
     df_in: pd.DataFrame,
     config: Dict[str, Any],
     teams: int,
     rounds: int,
-    weight_proj: float = 0.65
+    weight_proj: float = 0.65,
 ) -> pd.DataFrame:
     if df_in is None or df_in.empty:
         return df_in
+
     df = df_in.copy()
+
+    # Ensure all projection columns are numeric so _proj_points_row stays stable
+    proj_cols = [
+        "PROJ_PTS", "PROJ_PASS_YDS", "PROJ_PASS_TD", "PROJ_RUSH_YDS", "PROJ_RUSH_TD",
+        "PROJ_REC", "PROJ_REC_YDS", "PROJ_REC_TD", "PROJ_FG", "PROJ_XP",
+        "PROJ_SACKS", "PROJ_TURNOVERS", "PROJ_POINTS_ALLOWED",
+    ]
+    for c in proj_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     scoring_cfg = dict(DEFAULT_SCORING)
     scoring_cfg["ppr"] = float(config.get("scoring", {}).get("ppr", scoring_cfg["ppr"]))
 
     # Base projections and blended value (if PROJ_PTS provided)
     df["calc_proj"] = df.apply(lambda r: _proj_points_row(r, scoring_cfg), axis=1)
-    df["proj_pts"] = df["PROJ_PTS"] if "PROJ_PTS" in df.columns else 0.0
     if "PROJ_PTS" in df.columns:
         df["value_blend"] = weight_proj * df["calc_proj"] + (1.0 - weight_proj) * df["PROJ_PTS"]
     else:
         df["value_blend"] = df["calc_proj"]
 
-    # Multipliers
+    # SOS multiplier (robust to garbage values)
     if "SOS SEASON" in df.columns:
-        df["sos_mult"] = df["SOS SEASON"].map(lambda s: SOS_MULT.get(int(s), 1.0) if pd.notna(s) else 1.0)
+        sos_num = pd.to_numeric(df["SOS SEASON"], errors="coerce").fillna(3).astype(int)
+        sos_num = sos_num.clip(lower=1, upper=5)
+        df["sos_mult"] = sos_num.map(SOS_MULT).fillna(1.0)
     else:
         df["sos_mult"] = 1.0
 
+    # Injury / volatility
     def _inj_pen(v):
         s = str(v or "").strip().lower()
         return INJURY_PEN.get(s, 0.0)
 
-    df["inj_mult"] = df.get("INJURY_RISK", pd.Series([""]*len(df))).map(_inj_pen).fillna(0.0)
-    df["coach_mult"] = 0.01 * ((~df.get("OC", pd.Series([None]*len(df))).isna()).astype(float))
+    df["inj_mult"] = df.get("INJURY_RISK", pd.Series([""] * len(df))).map(_inj_pen).fillna(0.0)
+
+    # Coaching tendency tiny nudge if OC present (placeholder 1% bump)
+    df["coach_mult"] = 0.01 * ((~df.get("OC", pd.Series([None] * len(df))).isna()).astype(float))
 
     # Final value before VBD
     df["value"] = df["value_blend"] * df["sos_mult"] * (1.0 + df["coach_mult"]) * (1.0 + df["inj_mult"])
@@ -110,8 +133,8 @@ def evaluate_players(
     starters_cfg.update(config.get("starters", {}))
     df["vbd"] = _compute_vbd(df, teams=teams, starters=starters_cfg)
 
-    # Ensure numeric types
-    for col in ["calc_proj","value_blend","sos_mult","inj_mult","coach_mult","value","vbd"]:
+    # Ensure numeric types (final guard)
+    for col in ["calc_proj", "value_blend", "sos_mult", "inj_mult", "coach_mult", "value", "vbd"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     return df
