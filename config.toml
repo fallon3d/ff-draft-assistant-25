@@ -16,6 +16,11 @@ DST = 1
 
 [scoring]
 ppr = 1.0
+w_proj = 0.65
+w_vbd = 0.35
+w_ecr_delta = 0.12
+w_injury_pen = 0.06
+w_volatility = 0.05
 
 [user_profile]
 sleeper_username = "Fallon3D"
