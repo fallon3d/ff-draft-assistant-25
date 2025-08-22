@@ -291,20 +291,25 @@ with tab_live:
                         st.markdown(f"**{row['PLAYER']}** ({row['POS']}, {row['TEAM']}) — Score: {row['score']:.2f} {tag}")
                         st.caption(row['why'])
 
-                with st.expander("Team Rosters (by position)", expanded=False):
-                    ros = roster.build_rosters(picks, users)
-                    if not ros:
-                        st.caption("No picks yet.")
-                    else:
-                        cols = st.columns(3)
-                        i = 0
-                        for team_name, rmap in ros.items():
-                            with cols[i % 3]:
-                                highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
-                                st.write(f"{highlight}**{team_name}**")
-                                for pos, players in rmap.items():
-                                    if players: st.write(f"- {pos}: {', '.join(players)}")
-                            i += 1
+              with st.expander("Team Rosters (by position)", expanded=False):
+    users = S.get("users") or [{"display_name": f"Team {i}", "roster_id": i} for i in range(1, teams+1)]
+    simple_picks = []
+    for p in pick_log:
+        # Prefer the slot computed upstream (from Sleeper's draft_slot)
+        sl = p.get("slot") or utils.slot_for_round_pick(int(p.get("round", 0) or 0),
+                                                        int(p.get("pick_no", 0) or 0),
+                                                        teams)
+        simple_picks.append({"roster_id": int(sl), "metadata": p.get("metadata", {})})
+    ros = roster.build_rosters(simple_picks, users)
+    cols = st.columns(3)
+    i = 0
+    for team_name, rmap in ros.items():
+        with cols[i % 3]:
+            highlight = "🟩 " if team_name.lower().startswith(sleeper_username.lower()) else ""
+            st.write(f"{highlight}**{team_name}**")
+            for pos, players in rmap.items():
+                if players: st.write(f"- {pos}: {', '.join(players)}")
+        i += 1
 
 # ===================== MOCK =====================
 with tab_mock:
