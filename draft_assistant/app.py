@@ -1,34 +1,16 @@
-import os, importlib
-import streamlit as st
+import sys, streamlit as st
+import pandas as pd, requests, pydantic, reportlab, toml, PIL
 
-st.set_page_config(page_title="FF Draft Assistant - Boot Check", page_icon="✅", layout="centered")
+st.set_page_config(page_title="Health Check", layout="centered")
+st.title("Streamlit Cloud Health Check ✅")
 
-st.title("Fantasy Football Draft Assistant")
-st.subheader("Milestone A: Boot Check ✅")
+st.write("**Python:**", sys.version)
+st.write("**streamlit:**", st.__version__)
+st.write("**pandas:**", pd.__version__)
+st.write("**requests:**", requests.__version__)
+st.write("**pydantic:**", pydantic.__version__)
+st.write("**reportlab:**", reportlab.Version)
+import PIL as pillow
+st.write("**Pillow:**", pillow.__version__)
 
-# Sanity: required folders
-expected = [
-    "draft_assistant/",
-    "draft_assistant/core/",
-    "draft_assistant/data/",
-]
-ok = True
-for p in expected:
-    exists = os.path.isdir(p.rstrip("/"))
-    st.write(("✅" if exists else "❌"), p)
-    ok = ok and exists
-
-# Minimal data check (optional in A)
-sample_players = "draft_assistant/data/sample_players.csv"
-st.write(("✅" if os.path.exists(sample_players) else "❌"), sample_players)
-
-# Import check for future modules (won't exist yet, that's fine)
-try:
-    importlib.import_module("core")
-    st.write("✅ Python can import 'core' package (once you add it).")
-except Exception:
-    st.write("ℹ️ 'core' not found yet (expected in Milestone A).")
-
-st.markdown("---")
-st.success("If this page loads on Streamlit Cloud, your deploy is working. Next: Milestone B (swap in the full app).")
-st.caption("Main file path for Cloud should be: draft_assistant/app.py")
+st.success("If you see versions above, the environment is good. Next: restore the real app.py.")
