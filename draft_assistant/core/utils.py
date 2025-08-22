@@ -185,4 +185,56 @@ def read_player_table(path: str) -> pd.DataFrame:
 # -------- Draft math --------
 def snake_position(overall_pick: int, teams: int) -> tuple[int,int,int]:
     r = (overall_pick - 1) // teams + 1
-    pos_in_round = (overall_pick - 1) % te_
+    pos_in_round = (overall_pick - 1) % teams + 1
+    slot = pos_in_round if (r % 2 == 1) else (teams - pos_in_round + 1)
+    return r, pos_in_round, slot
+
+def slot_for_overall(overall_pick: int, teams: int) -> int:
+    return snake_position(overall_pick, teams)[2]
+
+def picks_until_next_turn(current_overall: int, teams: int, user_slot: int) -> int:
+    r, _, slot = snake_position(current_overall, teams)
+    # If you pick later in this round:
+    if (r % 2 == 1 and slot < user_slot) or (r % 2 == 0 and slot > user_slot):
+        return abs(user_slot - slot)
+    # Otherwise finish round, then count to your next turn
+    to_end = teams - slot
+    to_next = (user_slot - 1) if r % 2 == 1 else (teams - user_slot)
+    return to_end + to_next + 1
+
+def next_pick_overall(start_overall_after_current: int, teams: int, user_slot: int) -> int:
+    n1 = start_overall_after_current
+    return n1 + picks_until_next_turn(n1, teams, user_slot) + 1
+
+def user_roster_id(users: list[dict], username: str) -> int | None:
+    if not users: return None
+    for u in users:
+        if str(u.get("display_name","")).strip().lower() == str(username).strip().lower():
+            return int(u.get("roster_id") or 1)
+    return None
+
+def slot_to_display_name(slot: int, users: list[dict]) -> str:
+    if not users: return f"Slot {slot}"
+    for u in users:
+        if int(u.get("roster_id", -1)) == int(slot):
+            nm = u.get("metadata", {}).get("team_name") or u.get("display_name") or f"Slot {slot}"
+            return str(nm)
+    return f"Slot {slot}"
+
+def remove_players_by_name(df: pd.DataFrame, names: set[str]) -> pd.DataFrame:
+    if not names or df is None or df.empty:
+        return df
+    mask = ~df["PLAYER"].isin(names)
+    return df.loc[mask].reset_index(drop=True)
+
+def lookup_bye_weeks(full_df: pd.DataFrame, names: list[str]) -> set[int]:
+    if not names or full_df is None or full_df.empty or "BYE" not in full_df.columns:
+        return set()
+    m = full_df.set_index("PLAYER")["BYE"].to_dict()
+    out = set()
+    for n in names:
+        v = m.get(n)
+        if pd.notna(v):
+            try: out.add(int(v))
+            except Exception: pass
+    return out
